@@ -1,0 +1,30 @@
+# Python & Backend
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/
+
+# Node & Frontend
+node_modules/
+dist/
+build/
+.npm/
+
+# Docker & Local Config
+.env
+docker-data/    # DB나 볼륨 데이터 저장용
+*.log
+
+# Geospatial Data (중요: 대용량 파일 무시)
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.geojson
+uploads/        # 업로드 폴더 무시
+processed/      # 변환된 파일 폴더 무시
+
+# OS
+.DS_Store
