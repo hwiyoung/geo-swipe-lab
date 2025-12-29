@@ -255,7 +255,7 @@ function App() {
         });
     };
 
-    // ===== SWIPE with real clipping =====
+    // ===== SWIPE with real clipping (accounting for pane transform offset) =====
     const startSwipe = (id) => {
         const map = mapInstanceRef.current;
         const pane = layerPanesRef.current[id];
@@ -275,101 +275,141 @@ function App() {
         const divider = document.createElement('div');
         divider.id = 'swipe-divider';
         divider.style.cssText = `
-      position: absolute;
-      top: 0;
-      left: 50%;
-      width: 4px;
-      height: 100%;
-      background: linear-gradient(180deg, #3b82f6 0%, #10b981 100%);
-      transform: translateX(-50%);
-      z-index: 1000;
-      cursor: ew-resize;
-      pointer-events: auto;
-      box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
-    `;
+            position: absolute;
+            top: 0;
+            left: 50%;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(180deg, #3b82f6 0%, #10b981 100%);
+            transform: translateX(-50%);
+            z-index: 1000;
+            cursor: ew-resize;
+            pointer-events: auto;
+            box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+        `;
 
         const handle = document.createElement('div');
         handle.id = 'swipe-handle';
         handle.style.cssText = `
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 40px;
-      height: 40px;
-      background: white;
-      border-radius: 50%;
-      transform: translate(-50%, -50%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-      cursor: ew-resize;
-      pointer-events: auto;
-      z-index: 1001;
-      font-size: 18px;
-      user-select: none;
-    `;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 40px;
+            height: 40px;
+            background: white;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            cursor: ew-resize;
+            pointer-events: auto;
+            z-index: 1001;
+            font-size: 18px;
+            user-select: none;
+        `;
         handle.textContent = '⇔';
 
         const label = document.createElement('div');
         label.id = 'swipe-label';
         label.style.cssText = `
-      position: absolute;
-      top: 10px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(0,0,0,0.85);
-      color: white;
-      padding: 5px 12px;
-      border-radius: 4px;
-      font-size: 11px;
-      z-index: 1002;
-      pointer-events: none;
-      white-space: nowrap;
-    `;
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.85);
+            color: white;
+            padding: 5px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            z-index: 1002;
+            pointer-events: none;
+            white-space: nowrap;
+        `;
         label.textContent = `Swipe: ${layerName}`;
 
         container.appendChild(divider);
         container.appendChild(handle);
         container.appendChild(label);
 
-        // Track current percentage (closure-safe)
+        // Track current percentage and animation frame
         let currentPct = 50;
+        let rafId = null;
 
-        // Apply clip function - clips the PANE element
+        // Get pane's transform offset (accounts for map panning)
+        const getPaneOffset = () => {
+            // The map pane uses CSS transform: translate3d(x, y, 0)
+            // We need to get this offset to adjust clip coordinates
+            const mapPane = map.getPane('mapPane');
+            if (!mapPane) return { x: 0, y: 0 };
+
+            const transform = mapPane.style.transform;
+            const match = transform.match(/translate3d\(([^,]+),\s*([^,]+),/);
+            if (match) {
+                return {
+                    x: parseFloat(match[1]) || 0,
+                    y: parseFloat(match[2]) || 0
+                };
+            }
+            return { x: 0, y: 0 };
+        };
+
+        // Apply clip function - clips the PANE element with offset compensation
         const applyClip = (pct) => {
             currentPct = pct;
 
-            // Update UI positions
+            // Update UI positions (screen-relative, no offset needed)
             divider.style.left = `${pct}%`;
             handle.style.left = `${pct}%`;
             setSwipePosition(pct);
 
-            // Calculate clip in pixels based on container width
+            // Calculate container dimensions
             const containerWidth = container.offsetWidth;
-            const clipX = (pct / 100) * containerWidth;
-
-            // Use clip property (older but more compatible) 
-            // clip: rect(top, right, bottom, left)
-            // To show left portion: rect(0, clipX, containerHeight, 0)
             const containerHeight = container.offsetHeight;
-            pane.style.clip = `rect(0px, ${clipX}px, ${containerHeight}px, 0px)`;
+
+            // Calculate clip X position in container coordinates
+            const containerClipX = (pct / 100) * containerWidth;
+
+            // Get pane offset (from CSS transform during panning)
+            const offset = getPaneOffset();
+
+            // Adjust clip coordinates to account for pane offset
+            // When pane moves left (negative offset.x), we need to extend clip right
+            // When pane moves right (positive offset.x), we need to reduce clip right
+            const adjustedClipRight = containerClipX - offset.x;
+            const adjustedClipLeft = -offset.x;
+            const adjustedClipTop = -offset.y;
+            const adjustedClipBottom = containerHeight - offset.y;
+
+            // Apply clip: rect(top, right, bottom, left)
+            pane.style.clip = `rect(${adjustedClipTop}px, ${adjustedClipRight}px, ${adjustedClipBottom}px, ${adjustedClipLeft}px)`;
         };
 
-        // Handle resize/move/zoom - update clip with current percentage
+        // Throttled update using requestAnimationFrame
+        const scheduleUpdate = () => {
+            if (rafId) return; // Already scheduled
+            rafId = requestAnimationFrame(() => {
+                rafId = null;
+                applyClip(currentPct);
+            });
+        };
+
+        // Handle map events - use 'move' for real-time updates during panning
         const onMapChange = () => {
-            applyClip(currentPct);
+            scheduleUpdate();
         };
-        map.on('resize', onMapChange);
-        map.on('move', onMapChange);
-        map.on('zoom', onMapChange);
-        map.on('moveend', onMapChange);
-        map.on('zoomend', onMapChange);
 
-        // Drag handling
+        map.on('move', onMapChange);      // Real-time during pan
+        map.on('zoom', onMapChange);      // During zoom
+        map.on('resize', onMapChange);    // On resize
+        map.on('moveend', onMapChange);   // Final update after pan
+        map.on('zoomend', onMapChange);   // Final update after zoom
+
+        // Drag handling for the swipe handle
         let dragging = false;
 
-        const onMove = (e) => {
+        const onMouseMove = (e) => {
             if (!dragging) return;
             e.preventDefault();
             const x = e.touches ? e.touches[0].clientX : e.clientX;
@@ -379,30 +419,30 @@ function App() {
             applyClip(pct);
         };
 
-        const onUp = () => {
+        const onMouseUp = () => {
             dragging = false;
             map.dragging.enable();
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-            document.removeEventListener('touchmove', onMove);
-            document.removeEventListener('touchend', onUp);
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            document.removeEventListener('touchmove', onMouseMove);
+            document.removeEventListener('touchend', onMouseUp);
         };
 
-        const onDown = (e) => {
+        const onMouseDown = (e) => {
             e.preventDefault();
             e.stopPropagation();
             dragging = true;
             map.dragging.disable();
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-            document.addEventListener('touchmove', onMove, { passive: false });
-            document.addEventListener('touchend', onUp);
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+            document.addEventListener('touchmove', onMouseMove, { passive: false });
+            document.addEventListener('touchend', onMouseUp);
         };
 
-        divider.addEventListener('mousedown', onDown);
-        divider.addEventListener('touchstart', onDown, { passive: false });
-        handle.addEventListener('mousedown', onDown);
-        handle.addEventListener('touchstart', onDown, { passive: false });
+        divider.addEventListener('mousedown', onMouseDown);
+        divider.addEventListener('touchstart', onMouseDown, { passive: false });
+        handle.addEventListener('mousedown', onMouseDown);
+        handle.addEventListener('touchstart', onMouseDown, { passive: false });
 
         // Initial clip at 50%
         applyClip(50);
@@ -410,6 +450,12 @@ function App() {
         swipeRef.current = {
             pane,
             cleanup: () => {
+                // Cancel any pending animation frame
+                if (rafId) {
+                    cancelAnimationFrame(rafId);
+                    rafId = null;
+                }
+
                 divider.remove();
                 handle.remove();
                 label.remove();
@@ -419,9 +465,9 @@ function App() {
                 pane.style.clipPath = '';
 
                 map.dragging.enable();
-                map.off('resize', onMapChange);
                 map.off('move', onMapChange);
                 map.off('zoom', onMapChange);
+                map.off('resize', onMapChange);
                 map.off('moveend', onMapChange);
                 map.off('zoomend', onMapChange);
             }
