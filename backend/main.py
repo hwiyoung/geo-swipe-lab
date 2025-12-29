@@ -173,39 +173,59 @@ async def get_cog_file(
 
 
 def convert_to_cog(input_path: Path, output_path: Path) -> None:
-    """Convert raster to Cloud Optimized GeoTIFF with overviews for fast loading"""
+    """Convert raster to Cloud Optimized GeoTIFF with overviews for fast loading.
+    Reprojects to EPSG:3857 (Web Mercator) for proper display in web maps.
+    """
+    from rasterio.warp import calculate_default_transform, reproject
+    from rasterio.crs import CRS
+    
+    dst_crs = CRS.from_epsg(3857)  # Web Mercator for Leaflet
+    
     with rasterio.open(input_path) as src:
+        # Calculate transform for reprojection
+        transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds
+        )
+        
         # Determine predictor based on data type
         dtype = src.dtypes[0]
         predictor = 2 if dtype in ['uint8', 'uint16', 'int16', 'uint32', 'int32'] else 3
         
-        # Read profile and update for COG with optimized settings
+        # Create profile for COG with optimized settings
         profile = src.profile.copy()
         profile.update(
             driver='GTiff',
+            crs=dst_crs,
+            transform=transform,
+            width=width,
+            height=height,
             tiled=True,
             blockxsize=512,
             blockysize=512,
-            compress='DEFLATE',      # Better compression than LZW
-            predictor=predictor,     # Improves compression ratio
+            compress='DEFLATE',
+            predictor=predictor,
             interleave='band',
-            bigtiff='YES',           # Support for large files
-            COPY_SRC_OVERVIEWS='YES' # Include overviews in final COG
+            bigtiff='YES',
         )
         
         with rasterio.open(output_path, 'w', **profile) as dst:
-            # Use windowed reading for memory efficiency
+            # Reproject each band
             for band_idx in range(1, src.count + 1):
-                for _, window in src.block_windows(band_idx):
-                    data = src.read(band_idx, window=window)
-                    dst.write(data, band_idx, window=window)
+                reproject(
+                    source=rasterio.band(src, band_idx),
+                    destination=rasterio.band(dst, band_idx),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.bilinear
+                )
             
             # Build comprehensive overviews for all zoom levels
-            # More levels = faster loading at various zoom levels
             overview_levels = [2, 4, 8, 16, 32, 64]
             
             # Filter overview levels based on image size
-            min_dim = min(src.width, src.height)
+            min_dim = min(width, height)
             valid_levels = [l for l in overview_levels if min_dim // l >= 64]
             
             if valid_levels:
