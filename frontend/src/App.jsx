@@ -5,13 +5,28 @@ import 'leaflet/dist/leaflet.css';
 import parseGeoraster from 'georaster';
 import GeoRasterLayer from 'georaster-layer-for-leaflet';
 
+// API base for normal requests (via Vite proxy)
 const API_BASE = '';
+
+// Backend URL for COG files (direct access for Range request support)
+// Vite dev server doesn't support HTTP Range requests properly
+const BACKEND_URL = 'http://localhost:8000';
 
 const uploadAxios = axios.create({
     timeout: 600000,
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
 });
+
+// Default style settings
+const DEFAULT_STYLES = {
+    newBuild: '#ff0000',      // Red for 신축/new
+    destroyed: '#00ff00',     // Green for 소멸/demolished
+    renewed: '#0000ff',       // Blue for 갱신/updated
+    baseMapBorder: '#333333', // Dark gray for base map
+    defaultBorder: '#6b7280', // Default gray
+    lineWeight: 2,            // Default line weight
+};
 
 function App() {
     const mapRef = useRef(null);
@@ -32,6 +47,10 @@ function App() {
     const [showLocalFiles, setShowLocalFiles] = useState(false);
     const [draggedIdx, setDraggedIdx] = useState(null);
     const [loading, setLoading] = useState({});
+
+    // Style editor state
+    const [styleSettings, setStyleSettings] = useState(DEFAULT_STYLES);
+    const [showStyleEditor, setShowStyleEditor] = useState(false);
 
     const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
 
@@ -55,6 +74,17 @@ function App() {
             mapInstanceRef.current = null;
         };
     }, []);
+
+    // Update vector layer styles when settings change
+    useEffect(() => {
+        Object.entries(layerObjectsRef.current).forEach(([layerId, leafletLayer]) => {
+            const layer = layers.find(l => l.id === layerId);
+            if (layer?.type === 'vector' && leafletLayer.setStyle) {
+                const styleFunc = createStyleFunction(layer.name, styleSettings);
+                leafletLayer.setStyle(styleFunc);
+            }
+        });
+    }, [styleSettings, layers]);
 
     const toast = useCallback((msg, type = 'success') => {
         const id = Date.now();
@@ -146,6 +176,77 @@ function App() {
         return paneName;
     };
 
+    // Create style function for vector layers
+    const createStyleFunction = (layerName, settings) => {
+        const layerNameLower = layerName.toLowerCase();
+        const isBaseMap = layerNameLower.includes('수치지도') ||
+            layerNameLower.includes('digital_map') ||
+            layerNameLower.includes('base');
+        const isChangeDetection = layerNameLower.includes('cd') ||
+            layerNameLower.includes('change') ||
+            layerNameLower.includes('결과') ||
+            layerNameLower.includes('result');
+
+        return (feature) => {
+            // Base map style: transparent fill, thin border
+            if (isBaseMap) {
+                return {
+                    color: settings.baseMapBorder,
+                    weight: Math.max(0.5, settings.lineWeight * 0.5),
+                    opacity: 0.7,
+                    fillColor: 'transparent',
+                    fillOpacity: 0
+                };
+            }
+
+            // Change detection style: color by class
+            if (isChangeDetection && feature?.properties) {
+                // Check various possible field names for class info
+                const className = feature.properties.class_name ||
+                    feature.properties.class ||
+                    feature.properties.type ||
+                    feature.properties.category ||
+                    feature.properties.cd_type ||
+                    feature.properties.change_type || '';
+
+                const classLower = String(className).toLowerCase();
+
+                let borderColor = settings.defaultBorder;
+
+                // Match new/신축/added
+                if (classLower.includes('new') || classLower.includes('신축') || classLower.includes('added')) {
+                    borderColor = settings.newBuild;
+                }
+                // Match demolished/소멸/deleted/removed
+                else if (classLower.includes('demolished') || classLower.includes('소멸') ||
+                    classLower.includes('deleted') || classLower.includes('removed')) {
+                    borderColor = settings.destroyed;
+                }
+                // Match updated/갱신/changed/modified
+                else if (classLower.includes('updated') || classLower.includes('갱신') ||
+                    classLower.includes('changed') || classLower.includes('modified')) {
+                    borderColor = settings.renewed;
+                }
+
+                return {
+                    color: borderColor,
+                    weight: settings.lineWeight,
+                    opacity: 0.9,
+                    fillColor: borderColor,
+                    fillOpacity: 0.25
+                };
+            }
+
+            // Default style
+            return {
+                color: settings.defaultBorder,
+                weight: settings.lineWeight,
+                opacity: 0.8,
+                fillOpacity: 0.35
+            };
+        };
+    };
+
     const addLayer = async (layer, orderIndex = 0) => {
         const map = mapInstanceRef.current;
         if (!map) return;
@@ -157,7 +258,6 @@ function App() {
         setLoading(p => ({ ...p, [layer.id]: true }));
 
         try {
-            const color = COLORS[layer.id.charCodeAt(0) % COLORS.length];
             const paneName = getOrCreatePane(layer.id, 100 - orderIndex);
             let leafletLayer;
 
@@ -165,12 +265,14 @@ function App() {
                 const res = await fetch(`${API_BASE}${layer.url}`);
                 const geojson = await res.json();
 
+                const styleFunc = createStyleFunction(layer.name, styleSettings);
+
                 leafletLayer = L.geoJSON(geojson, {
                     pane: paneName,
-                    style: { color, weight: 2, opacity: 0.8, fillOpacity: 0.35 },
+                    style: styleFunc,
                     onEachFeature: (f, lyr) => {
                         if (f.properties && Object.keys(f.properties).length) {
-                            const html = Object.entries(f.properties).slice(0, 6)
+                            const html = Object.entries(f.properties).slice(0, 8)
                                 .map(([k, v]) => `<b>${k}:</b> ${v}`).join('<br>');
                             lyr.bindPopup(html);
                         }
@@ -184,26 +286,67 @@ function App() {
                 if (bounds.isValid()) map.fitBounds(bounds, { padding: [50, 50] });
 
             } else if (layer.type === 'raster') {
-                const res = await fetch(`${API_BASE}${layer.url}`);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                // ============================================================
+                // COG STREAMING with Custom Range Request Endpoint
+                // Uses /api/cog/{filename} which properly returns 206 Partial Content
+                // This fixes the RangeError: Invalid typed array length issue
+                //
+                // DEBUG: Check browser Network tab for the TIF request:
+                // - 206 Partial Content (multiple small requests) → streaming works ✓
+                // - 200 OK (one large request) → not streaming
+                // ============================================================
 
-                const arrayBuffer = await res.arrayBuffer();
-                const georaster = await parseGeoraster(arrayBuffer);
+                // Extract filename from layer.url (e.g., "/processed/file.tif" -> "file.tif")
+                const filename = layer.url.replace('/processed/', '');
+                const cogUrl = `${BACKEND_URL}/api/cog/${filename}`;
+                console.log('[COG] Loading via Range API:', cogUrl);
 
-                leafletLayer = new GeoRasterLayer({
-                    georaster,
-                    opacity: 0.85,
-                    resolution: 128,
-                    pane: paneName
-                });
+                try {
+                    const georaster = await parseGeoraster(cogUrl);
+                    console.log('[COG] Georaster loaded successfully:', {
+                        width: georaster.width,
+                        height: georaster.height,
+                        numberOfRasters: georaster.numberOfRasters
+                    });
 
-                leafletLayer.addTo(map);
-                layerObjectsRef.current[layer.id] = leafletLayer;
+                    leafletLayer = new GeoRasterLayer({
+                        georaster,
+                        opacity: 0.85,
+                        resolution: 256,  // Higher value = better quality, uses overviews
+                        pane: paneName
+                    });
 
-                setTimeout(() => {
-                    const bounds = leafletLayer.getBounds();
-                    if (bounds) map.fitBounds(bounds, { padding: [50, 50] });
-                }, 100);
+                    leafletLayer.addTo(map);
+                    layerObjectsRef.current[layer.id] = leafletLayer;
+
+                    setTimeout(() => {
+                        const bounds = leafletLayer.getBounds();
+                        if (bounds) map.fitBounds(bounds, { padding: [50, 50] });
+                    }, 100);
+                } catch (cogError) {
+                    console.error('[COG] Streaming failed, trying fallback:', cogError);
+
+                    // Fallback: fetch entire file (slower but works)
+                    toast('COG streaming failed, using fallback...', 'error');
+                    const res = await fetch(`${API_BASE}${layer.url}`);
+                    const arrayBuffer = await res.arrayBuffer();
+                    const georaster = await parseGeoraster(arrayBuffer);
+
+                    leafletLayer = new GeoRasterLayer({
+                        georaster,
+                        opacity: 0.85,
+                        resolution: 256,
+                        pane: paneName
+                    });
+
+                    leafletLayer.addTo(map);
+                    layerObjectsRef.current[layer.id] = leafletLayer;
+
+                    setTimeout(() => {
+                        const bounds = leafletLayer.getBounds();
+                        if (bounds) map.fitBounds(bounds, { padding: [50, 50] });
+                    }, 100);
+                }
             }
         } catch (e) {
             console.error(`Failed to load layer ${layer.name}:`, e);
@@ -255,7 +398,12 @@ function App() {
         });
     };
 
-    // ===== SWIPE with real clipping (accounting for pane transform offset) =====
+    // Handle style setting changes
+    const handleStyleChange = (key, value) => {
+        setStyleSettings(prev => ({ ...prev, [key]: value }));
+    };
+
+    // ===== SWIPE with real clipping =====
     const startSwipe = (id) => {
         const map = mapInstanceRef.current;
         const pane = layerPanesRef.current[id];
@@ -271,7 +419,6 @@ function App() {
         const container = map.getContainer();
         const layerName = layers.find(l => l.id === id)?.name || id;
 
-        // Create UI elements
         const divider = document.createElement('div');
         divider.id = 'swipe-divider';
         divider.style.cssText = `
@@ -333,14 +480,10 @@ function App() {
         container.appendChild(handle);
         container.appendChild(label);
 
-        // Track current percentage and animation frame
         let currentPct = 50;
         let rafId = null;
 
-        // Get pane's transform offset (accounts for map panning)
         const getPaneOffset = () => {
-            // The map pane uses CSS transform: translate3d(x, y, 0)
-            // We need to get this offset to adjust clip coordinates
             const mapPane = map.getPane('mapPane');
             if (!mapPane) return { x: 0, y: 0 };
 
@@ -355,58 +498,41 @@ function App() {
             return { x: 0, y: 0 };
         };
 
-        // Apply clip function - clips the PANE element with offset compensation
         const applyClip = (pct) => {
             currentPct = pct;
-
-            // Update UI positions (screen-relative, no offset needed)
             divider.style.left = `${pct}%`;
             handle.style.left = `${pct}%`;
             setSwipePosition(pct);
 
-            // Calculate container dimensions
             const containerWidth = container.offsetWidth;
             const containerHeight = container.offsetHeight;
-
-            // Calculate clip X position in container coordinates
             const containerClipX = (pct / 100) * containerWidth;
-
-            // Get pane offset (from CSS transform during panning)
             const offset = getPaneOffset();
 
-            // Adjust clip coordinates to account for pane offset
-            // When pane moves left (negative offset.x), we need to extend clip right
-            // When pane moves right (positive offset.x), we need to reduce clip right
             const adjustedClipRight = containerClipX - offset.x;
             const adjustedClipLeft = -offset.x;
             const adjustedClipTop = -offset.y;
             const adjustedClipBottom = containerHeight - offset.y;
 
-            // Apply clip: rect(top, right, bottom, left)
             pane.style.clip = `rect(${adjustedClipTop}px, ${adjustedClipRight}px, ${adjustedClipBottom}px, ${adjustedClipLeft}px)`;
         };
 
-        // Throttled update using requestAnimationFrame
         const scheduleUpdate = () => {
-            if (rafId) return; // Already scheduled
+            if (rafId) return;
             rafId = requestAnimationFrame(() => {
                 rafId = null;
                 applyClip(currentPct);
             });
         };
 
-        // Handle map events - use 'move' for real-time updates during panning
-        const onMapChange = () => {
-            scheduleUpdate();
-        };
+        const onMapChange = () => scheduleUpdate();
 
-        map.on('move', onMapChange);      // Real-time during pan
-        map.on('zoom', onMapChange);      // During zoom
-        map.on('resize', onMapChange);    // On resize
-        map.on('moveend', onMapChange);   // Final update after pan
-        map.on('zoomend', onMapChange);   // Final update after zoom
+        map.on('move', onMapChange);
+        map.on('zoom', onMapChange);
+        map.on('resize', onMapChange);
+        map.on('moveend', onMapChange);
+        map.on('zoomend', onMapChange);
 
-        // Drag handling for the swipe handle
         let dragging = false;
 
         const onMouseMove = (e) => {
@@ -444,26 +570,17 @@ function App() {
         handle.addEventListener('mousedown', onMouseDown);
         handle.addEventListener('touchstart', onMouseDown, { passive: false });
 
-        // Initial clip at 50%
         applyClip(50);
 
         swipeRef.current = {
             pane,
             cleanup: () => {
-                // Cancel any pending animation frame
-                if (rafId) {
-                    cancelAnimationFrame(rafId);
-                    rafId = null;
-                }
-
+                if (rafId) cancelAnimationFrame(rafId);
                 divider.remove();
                 handle.remove();
                 label.remove();
-
-                // Reset clip
                 pane.style.clip = '';
                 pane.style.clipPath = '';
-
                 map.dragging.enable();
                 map.off('move', onMapChange);
                 map.off('zoom', onMapChange);
@@ -561,6 +678,74 @@ function App() {
                         <div className="swipe-bar">
                             <b>{layers.find(l => l.id === swipeLayerId)?.name}</b> | {Math.round(swipePosition)}%
                             <button onClick={stopSwipe}>Stop</button>
+                        </div>
+                    )}
+                </div>
+
+                {/* Style Editor */}
+                <div className="card">
+                    <div className="card-title">
+                        🎨 Style Editor
+                        <button className="toggle-btn" onClick={() => setShowStyleEditor(!showStyleEditor)}>
+                            {showStyleEditor ? '▲' : '▼'}
+                        </button>
+                    </div>
+                    {showStyleEditor && (
+                        <div className="style-editor">
+                            <div className="style-section">
+                                <div className="style-section-title">Colors</div>
+                                <div className="style-row">
+                                    <span>🔴 신축 (New)</span>
+                                    <input
+                                        type="color"
+                                        value={styleSettings.newBuild}
+                                        onChange={(e) => handleStyleChange('newBuild', e.target.value)}
+                                    />
+                                </div>
+                                <div className="style-row">
+                                    <span>🟢 소멸 (Demolished)</span>
+                                    <input
+                                        type="color"
+                                        value={styleSettings.destroyed}
+                                        onChange={(e) => handleStyleChange('destroyed', e.target.value)}
+                                    />
+                                </div>
+                                <div className="style-row">
+                                    <span>🔵 갱신 (Updated)</span>
+                                    <input
+                                        type="color"
+                                        value={styleSettings.renewed}
+                                        onChange={(e) => handleStyleChange('renewed', e.target.value)}
+                                    />
+                                </div>
+                                <div className="style-row">
+                                    <span>⬛ Base Map</span>
+                                    <input
+                                        type="color"
+                                        value={styleSettings.baseMapBorder}
+                                        onChange={(e) => handleStyleChange('baseMapBorder', e.target.value)}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="style-section">
+                                <div className="style-section-title">Line Weight</div>
+                                <div className="style-row">
+                                    <span>Thickness: {styleSettings.lineWeight.toFixed(1)}</span>
+                                    <input
+                                        type="range"
+                                        min="0.5"
+                                        max="5"
+                                        step="0.5"
+                                        value={styleSettings.lineWeight}
+                                        onChange={(e) => handleStyleChange('lineWeight', parseFloat(e.target.value))}
+                                    />
+                                </div>
+                            </div>
+
+                            <button className="btn" onClick={() => setStyleSettings(DEFAULT_STYLES)}>
+                                Reset to Default
+                            </button>
                         </div>
                     )}
                 </div>

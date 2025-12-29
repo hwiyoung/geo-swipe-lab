@@ -4,14 +4,15 @@ import shutil
 import tempfile
 import zipfile
 import asyncio
+import re
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import rasterio
@@ -19,15 +20,16 @@ from rasterio.io import MemoryFile
 from rasterio.enums import Resampling
 import geopandas as gpd
 
-app = FastAPI(title="GIS Swipe Lab API", version="1.1.0")
+app = FastAPI(title="GIS Swipe Lab API", version="1.2.0")
 
-# CORS configuration
+# CORS configuration with exposed headers for Range requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Range", "Content-Length", "Accept-Ranges"],
 )
 
 # Paths
@@ -39,7 +41,7 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 # Thread pool for CPU-intensive operations
 executor = ThreadPoolExecutor(max_workers=2)
 
-# Mount static files
+# Mount static files (for non-COG files like GeoJSON)
 app.mount("/processed", StaticFiles(directory=str(PROCESSED_DIR)), name="processed")
 
 
@@ -58,19 +60,137 @@ def is_vector_file(filename: str) -> bool:
     return filename.lower().endswith(('.shp', '.geojson', '.json', '.zip'))
 
 
+# ============================================================
+# COG Streaming Endpoint with HTTP Range Request Support
+# This properly returns 206 Partial Content for georaster streaming
+# ============================================================
+@app.api_route("/api/cog/{filename:path}", methods=["GET", "HEAD"])
+async def get_cog_file(
+    filename: str,
+    request: Request,
+    range: Optional[str] = Header(None)
+):
+    """
+    Serve COG files with proper HTTP Range request support.
+    Returns 206 Partial Content for Range requests, 200 OK otherwise.
+    Also handles HEAD requests for file existence checks.
+    """
+    # Security: prevent path traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = PROCESSED_DIR / filename
+    
+    # Handle .ovr files (external overviews) - return 404 since we use internal overviews
+    if filename.lower().endswith('.ovr'):
+        raise HTTPException(status_code=404, detail="External overview not found (using internal overviews)")
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    
+    if not file_path.suffix.lower() in ['.tif', '.tiff']:
+        raise HTTPException(status_code=400, detail="Only TIF files are served via this endpoint")
+    
+    file_size = file_path.stat().st_size
+    
+    # Common headers
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "image/tiff",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    }
+    
+    # Handle Range request
+    if range:
+        # Parse Range header: "bytes=start-end" or "bytes=start-"
+        range_match = re.match(r'bytes=(\d+)-(\d*)', range)
+        if range_match:
+            start = int(range_match.group(1))
+            end_str = range_match.group(2)
+            end = int(end_str) if end_str else file_size - 1
+            
+            # Clamp end to file size
+            end = min(end, file_size - 1)
+            
+            if start > end or start >= file_size:
+                raise HTTPException(status_code=416, detail="Range not satisfiable")
+            
+            content_length = end - start + 1
+            
+            # Read specific byte range
+            def iter_file_range():
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    remaining = content_length
+                    chunk_size = 64 * 1024  # 64KB chunks
+                    while remaining > 0:
+                        read_size = min(chunk_size, remaining)
+                        data = f.read(read_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+            
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            headers["Content-Length"] = str(content_length)
+            
+            return StreamingResponse(
+                iter_file_range(),
+                status_code=206,
+                headers=headers,
+                media_type="image/tiff"
+            )
+    
+    # Handle HEAD request - return headers only
+    if request.method == "HEAD":
+        headers["Content-Length"] = str(file_size)
+        return Response(
+            content=None,
+            status_code=200,
+            headers=headers,
+            media_type="image/tiff"
+        )
+    
+    # GET without Range header - return full file with streaming
+    def iter_file():
+        with open(file_path, "rb") as f:
+            chunk_size = 64 * 1024
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                yield data
+    
+    headers["Content-Length"] = str(file_size)
+    
+    return StreamingResponse(
+        iter_file(),
+        status_code=200,
+        headers=headers,
+        media_type="image/tiff"
+    )
+
+
 def convert_to_cog(input_path: Path, output_path: Path) -> None:
-    """Convert raster to Cloud Optimized GeoTIFF with memory-efficient windowed reading"""
+    """Convert raster to Cloud Optimized GeoTIFF with overviews for fast loading"""
     with rasterio.open(input_path) as src:
-        # Read profile and update for COG
+        # Determine predictor based on data type
+        dtype = src.dtypes[0]
+        predictor = 2 if dtype in ['uint8', 'uint16', 'int16', 'uint32', 'int32'] else 3
+        
+        # Read profile and update for COG with optimized settings
         profile = src.profile.copy()
         profile.update(
             driver='GTiff',
             tiled=True,
             blockxsize=512,
             blockysize=512,
-            compress='LZW',
+            compress='DEFLATE',      # Better compression than LZW
+            predictor=predictor,     # Improves compression ratio
             interleave='band',
-            bigtiff='YES'  # Support for large files
+            bigtiff='YES',           # Support for large files
+            COPY_SRC_OVERVIEWS='YES' # Include overviews in final COG
         )
         
         with rasterio.open(output_path, 'w', **profile) as dst:
@@ -80,10 +200,17 @@ def convert_to_cog(input_path: Path, output_path: Path) -> None:
                     data = src.read(band_idx, window=window)
                     dst.write(data, band_idx, window=window)
             
-            # Build overviews
-            overview_levels = [2, 4, 8, 16]
-            dst.build_overviews(overview_levels, Resampling.average)
-            dst.update_tags(ns='rio_overview', resampling='average')
+            # Build comprehensive overviews for all zoom levels
+            # More levels = faster loading at various zoom levels
+            overview_levels = [2, 4, 8, 16, 32, 64]
+            
+            # Filter overview levels based on image size
+            min_dim = min(src.width, src.height)
+            valid_levels = [l for l in overview_levels if min_dim // l >= 64]
+            
+            if valid_levels:
+                dst.build_overviews(valid_levels, Resampling.average)
+                dst.update_tags(ns='rio_overview', resampling='average')
 
 
 def convert_vector_to_geojson(input_path: Path, output_path: Path) -> None:
