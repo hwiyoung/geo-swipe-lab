@@ -333,8 +333,13 @@ function App() {
         container.appendChild(handle);
         container.appendChild(label);
 
+        // Track current percentage (closure-safe)
+        let currentPct = 50;
+
         // Apply clip function - clips the PANE element
         const applyClip = (pct) => {
+            currentPct = pct;
+
             // Update UI positions
             divider.style.left = `${pct}%`;
             handle.style.left = `${pct}%`;
@@ -349,21 +354,20 @@ function App() {
             // To show left portion: rect(0, clipX, containerHeight, 0)
             const containerHeight = container.offsetHeight;
             pane.style.clip = `rect(0px, ${clipX}px, ${containerHeight}px, 0px)`;
-
-            console.log(`Swipe applied: clip = rect(0, ${clipX}px, ${containerHeight}px, 0) on pane`, pane);
         };
 
-        // Handle resize - update clip on map resize
-        const onResize = () => {
-            applyClip(swipePosition);
+        // Handle resize/move/zoom - update clip with current percentage
+        const onMapChange = () => {
+            applyClip(currentPct);
         };
-        map.on('resize', onResize);
-        map.on('move', onResize);
-        map.on('zoom', onResize);
+        map.on('resize', onMapChange);
+        map.on('move', onMapChange);
+        map.on('zoom', onMapChange);
+        map.on('moveend', onMapChange);
+        map.on('zoomend', onMapChange);
 
         // Drag handling
         let dragging = false;
-        let currentPct = 50;
 
         const onMove = (e) => {
             if (!dragging) return;
@@ -372,7 +376,6 @@ function App() {
             const rect = container.getBoundingClientRect();
             let pct = ((x - rect.left) / rect.width) * 100;
             pct = Math.max(5, Math.min(95, pct));
-            currentPct = pct;
             applyClip(pct);
         };
 
@@ -416,9 +419,11 @@ function App() {
                 pane.style.clipPath = '';
 
                 map.dragging.enable();
-                map.off('resize', onResize);
-                map.off('move', onResize);
-                map.off('zoom', onResize);
+                map.off('resize', onMapChange);
+                map.off('move', onMapChange);
+                map.off('zoom', onMapChange);
+                map.off('moveend', onMapChange);
+                map.off('zoomend', onMapChange);
             }
         };
 
