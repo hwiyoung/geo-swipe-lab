@@ -1,7 +1,7 @@
 {
   "name": "geo-swipe-lab",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,11 +11,11 @@
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "leaflet": "^1.9.4",
-    "react-leaflet": "^4.2.1",
-    "georaster": "^1.6.0",
-    "georaster-layer-for-leaflet": "^3.10.0",
-    "axios": "^1.6.5"
+    "maplibre-gl": "^4.7.1",
+    "@maplibre/maplibre-gl-compare": "^0.5.0",
+    "pmtiles": "^3.2.0",
+    "axios": "^1.6.5",
+    "@hello-pangea/dnd": "^16.5.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.48",

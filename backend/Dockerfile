@@ -1,12 +1,23 @@
 FROM python:3.11-slim
 
-# Install GDAL system dependencies
+# Install GDAL system dependencies and tippecanoe build dependencies
 RUN apt-get update && apt-get install -y \
     gdal-bin \
     libgdal-dev \
     gcc \
     g++ \
+    git \
+    make \
+    libsqlite3-dev \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build and install tippecanoe (for GeoJSON to PMTiles conversion)
+RUN git clone https://github.com/felt/tippecanoe.git /tmp/tippecanoe \
+    && cd /tmp/tippecanoe \
+    && make -j$(nproc) \
+    && make install \
+    && rm -rf /tmp/tippecanoe
 
 # Set GDAL environment variables
 ENV GDAL_CONFIG=/usr/bin/gdal-config

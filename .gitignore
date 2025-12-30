@@ -12,10 +12,12 @@ build/
 
 # Docker & Local Config
 .env
-docker-data/    # DB나 볼륨 데이터 저장용
+docker-data/
 *.log
 
-# Geospatial Data (중요: 대용량 파일 무시)
+# Geospatial Data (DO NOT COMMIT)
+uploads/
+processed/
 *.tif
 *.tiff
 *.shp
@@ -23,8 +25,8 @@ docker-data/    # DB나 볼륨 데이터 저장용
 *.dbf
 *.prj
 *.geojson
-uploads/        # 업로드 폴더 무시
-processed/      # 변환된 파일 폴더 무시
+*.pmtiles
+*.zip
 
 # OS
 .DS_Store

@@ -1,16 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import L from 'leaflet';
-import 'leaflet/dist/leaflet.css';
-import parseGeoraster from 'georaster';
-import GeoRasterLayer from 'georaster-layer-for-leaflet';
+import maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import * as pmtiles from 'pmtiles';
+import { DragDropContext, Droppable, Draggable } from '@hello-pangea/dnd';
+import '@maplibre/maplibre-gl-compare/dist/maplibre-gl-compare.css';
 
 // API base for normal requests (via Vite proxy)
 const API_BASE = '';
 
-// Backend URL for COG files (direct access for Range request support)
-// Vite dev server doesn't support HTTP Range requests properly
-const BACKEND_URL = 'http://localhost:8000';
+// Backend URL for tiles and PMTiles (direct access)
+const BACKEND_URL = window.location.origin;
 
 const uploadAxios = axios.create({
     timeout: 600000,
@@ -20,71 +20,321 @@ const uploadAxios = axios.create({
 
 // Default style settings
 const DEFAULT_STYLES = {
-    newBuild: '#ff0000',      // Red for 신축/new
-    destroyed: '#00ff00',     // Green for 소멸/demolished
-    renewed: '#0000ff',       // Blue for 갱신/updated
-    baseMapBorder: '#333333', // Dark gray for base map
-    defaultBorder: '#6b7280', // Default gray
-    lineWeight: 2,            // Default line weight
+    newBuild: '#ff0000',
+    destroyed: '#00ff00',
+    renewed: '#0000ff',
+    baseMapBorder: '#333333',
+    defaultBorder: '#6b7280',
+    lineWeight: 2,
+    fillOpacity: 0.25,
 };
 
+// Register PMTiles protocol globally
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol('pmtiles', protocol.tile);
+
 function App() {
+    const mapContainerRef = useRef(null);
+    const beforeMapContainerRef = useRef(null);
+    const afterMapContainerRef = useRef(null);
     const mapRef = useRef(null);
-    const mapInstanceRef = useRef(null);
-    const layerObjectsRef = useRef({});
-    const layerPanesRef = useRef({});
-    const swipeRef = useRef(null);
+    const beforeMapRef = useRef(null);
+    const afterMapRef = useRef(null);
+    const compareRef = useRef(null);
+    const fpsRef = useRef({ frameCount: 0, lastTime: performance.now(), rafId: null });
 
     const [layers, setLayers] = useState([]);
     const [layerVisibility, setLayerVisibility] = useState({});
-    const [swipeLayerId, setSwipeLayerId] = useState(null);
-    const [swipePosition, setSwipePosition] = useState(50);
     const [uploading, setUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
     const [toasts, setToasts] = useState([]);
     const [fileDragging, setFileDragging] = useState(false);
     const [localFiles, setLocalFiles] = useState([]);
     const [showLocalFiles, setShowLocalFiles] = useState(false);
-    const [draggedIdx, setDraggedIdx] = useState(null);
     const [loading, setLoading] = useState({});
 
     // Style editor state
     const [styleSettings, setStyleSettings] = useState(DEFAULT_STYLES);
     const [showStyleEditor, setShowStyleEditor] = useState(false);
 
-    const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
+    // FPS meter state
+    const [fps, setFps] = useState(0);
 
+    // Swipe mode state
+    const [swipeLayerId, setSwipeLayerId] = useState(null);
+    const [sliderValue, setSliderValue] = useState(50);
+
+    // FPS meter using requestAnimationFrame
     useEffect(() => {
-        if (!mapRef.current || mapInstanceRef.current) return;
+        const updateFps = () => {
+            fpsRef.current.frameCount++;
+            const now = performance.now();
+            if (now - fpsRef.current.lastTime >= 1000) {
+                setFps(fpsRef.current.frameCount);
+                fpsRef.current.frameCount = 0;
+                fpsRef.current.lastTime = now;
+            }
+            fpsRef.current.rafId = requestAnimationFrame(updateFps);
+        };
+        fpsRef.current.rafId = requestAnimationFrame(updateFps);
+        return () => {
+            if (fpsRef.current.rafId) {
+                cancelAnimationFrame(fpsRef.current.rafId);
+            }
+        };
+    }, []);
 
-        const map = L.map(mapRef.current, {
-            center: [37.5665, 126.9780],
-            zoom: 10,
+    // Initialize map
+    useEffect(() => {
+        if (!mapContainerRef.current || mapRef.current) return;
+
+        const map = new maplibregl.Map({
+            container: mapContainerRef.current,
+            style: {
+                version: 8,
+                sources: {
+                    'osm': {
+                        type: 'raster',
+                        tiles: ['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png', 'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png', 'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                        tileSize: 256,
+                        attribution: '© OpenStreetMap'
+                    }
+                },
+                layers: [{
+                    id: 'osm-layer',
+                    type: 'raster',
+                    source: 'osm',
+                    minzoom: 0,
+                    maxzoom: 19
+                }]
+            },
+            center: [126.9780, 37.5665],
+            zoom: 10
         });
 
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OSM'
-        }).addTo(map);
+        map.addControl(new maplibregl.NavigationControl(), 'top-left');
 
-        mapInstanceRef.current = map;
-        fetchLayers();
+        map.on('load', () => {
+            mapRef.current = map;
+            fetchLayers();
+        });
+
+        // Debug: Log properties on click
+        map.on('click', (e) => {
+            const features = map.queryRenderedFeatures(e.point);
+            if (features.length > 0) {
+                console.log('[DEBUG] Clicked features:', features.map(f => f.properties));
+            }
+        });
 
         return () => {
-            map.remove();
-            mapInstanceRef.current = null;
+            if (mapRef.current) {
+                mapRef.current.remove();
+                mapRef.current = null;
+            }
         };
     }, []);
 
     // Update vector layer styles when settings change
     useEffect(() => {
-        Object.entries(layerObjectsRef.current).forEach(([layerId, leafletLayer]) => {
-            const layer = layers.find(l => l.id === layerId);
-            if (layer?.type === 'vector' && leafletLayer.setStyle) {
-                const styleFunc = createStyleFunction(layer.name, styleSettings);
-                leafletLayer.setStyle(styleFunc);
+        const map = mapRef.current;
+        if (!map || !map.isStyleLoaded()) return;
+
+        layers.forEach(layer => {
+            if (layer.type === 'vector' && layer.pmtilesUrl) {
+                const layerId = `vector-fill-${layer.id}`;
+                const lineId = `vector-line-${layer.id}`;
+
+                if (map.getLayer(layerId)) {
+                    map.setPaintProperty(layerId, 'fill-opacity', styleSettings.fillOpacity);
+                    // Update data-driven color expression if it's a CD layer
+                    const colorExpr = getColorExpression(layer.name);
+                    map.setPaintProperty(layerId, 'fill-color', colorExpr);
+                }
+                if (map.getLayer(lineId)) {
+                    map.setPaintProperty(lineId, 'line-width', styleSettings.lineWeight);
+                    const colorExpr = getColorExpression(layer.name);
+                    map.setPaintProperty(lineId, 'line-color', colorExpr);
+                }
             }
         });
     }, [styleSettings, layers]);
+
+    // Handle swipe mode setup (Manual Synchronization)
+    useEffect(() => {
+        if (!swipeLayerId || !beforeMapContainerRef.current || !afterMapContainerRef.current) return;
+
+        const commonStyle = {
+            version: 8,
+            sources: {
+                'osm': {
+                    type: 'raster',
+                    tiles: ['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png', 'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                    tileSize: 256
+                }
+            },
+            layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+        };
+
+        const beforeMap = new maplibregl.Map({
+            container: beforeMapContainerRef.current,
+            style: commonStyle,
+            center: mapRef.current?.getCenter() || [126.9780, 37.5665],
+            zoom: mapRef.current?.getZoom() || 10
+        });
+
+        const afterMap = new maplibregl.Map({
+            container: afterMapContainerRef.current,
+            style: commonStyle,
+            center: mapRef.current?.getCenter() || [126.9780, 37.5665],
+            zoom: mapRef.current?.getZoom() || 10
+        });
+
+        beforeMapRef.current = beforeMap;
+        afterMapRef.current = afterMap;
+
+        // Manual Synchronization with loop protection
+        const onMove = (master, slave) => {
+            if (!master.isMoving()) return;
+            slave.jumpTo({
+                center: master.getCenter(),
+                zoom: master.getZoom(),
+                bearing: master.getBearing(),
+                pitch: master.getPitch()
+            });
+        };
+
+        beforeMap.on('move', () => onMove(beforeMap, afterMap));
+        afterMap.on('move', () => onMove(afterMap, beforeMap));
+
+        // Add layers: 
+        // afterMap (Bottom): All visible layers EXCEPT the swiped one
+        // beforeMap (Top): All visible layers INCLUDING the swiped one
+        const syncLayers = async () => {
+            const visibleLayers = layers.filter(l => layerVisibility[l.id]);
+
+            const backgroundLayers = visibleLayers.filter(l => l.id !== swipeLayerId);
+            for (const l of backgroundLayers) {
+                await addLayerToSpecificMap(afterMap, l);
+                await addLayerToSpecificMap(beforeMap, l);
+            }
+
+            const swipedLayer = layers.find(l => l.id === swipeLayerId);
+            if (swipedLayer) await addLayerToSpecificMap(beforeMap, swipedLayer);
+
+            // Force correct stack order on both maps
+            reorderMapLayers(visibleLayers, beforeMap);
+            reorderMapLayers(backgroundLayers, afterMap);
+        };
+
+        beforeMap.on('load', syncLayers);
+        afterMap.on('load', syncLayers);
+
+        return () => {
+            if (beforeMapRef.current) beforeMapRef.current.remove();
+            if (afterMapRef.current) afterMapRef.current.remove();
+        };
+    }, [swipeLayerId]);
+
+    const addLayerToSpecificMap = async (targetMap, layer) => {
+        if (!targetMap) return;
+        // Simplified version of addLayerToMap for compare maps
+        if (layer.type === 'vector' && layer.pmtilesUrl) {
+            const sourceUrl = `pmtiles://${BACKEND_URL}/api/cog/${layer.pmtilesUrl.replace('/processed/', '')}`;
+            const sourceId = `source-${layer.id}`;
+            const fillId = `fill-${layer.id}`;
+            const lineId = `line-${layer.id}`;
+
+            if (!targetMap.getSource(sourceId)) {
+                targetMap.addSource(sourceId, { type: 'vector', url: sourceUrl });
+            }
+
+            // Try to get source layer name
+            let sourceLayer = 'default';
+            try {
+                const pmtilesFilename = layer.pmtilesUrl.replace('/processed/', '');
+                const pmtilesFullUrl = `${BACKEND_URL}/api/cog/${pmtilesFilename}`;
+                const p = new pmtiles.PMTiles(pmtilesFullUrl);
+                const metadata = await p.getMetadata();
+                sourceLayer = metadata?.vector_layers?.[0]?.id || 'default';
+            } catch (e) {
+                console.warn('[Compare] PMTiles metadata fetch failed:', e);
+            }
+
+            if (!targetMap.getLayer(fillId)) {
+                targetMap.addLayer({
+                    id: fillId, type: 'fill', source: sourceId, 'source-layer': sourceLayer,
+                    paint: { 'fill-color': getColorExpression(layer.name), 'fill-opacity': styleSettings.fillOpacity }
+                });
+            }
+            if (!targetMap.getLayer(lineId)) {
+                targetMap.addLayer({
+                    id: lineId, type: 'line', source: sourceId, 'source-layer': sourceLayer,
+                    paint: { 'line-color': getColorExpression(layer.name), 'line-width': styleSettings.lineWeight }
+                });
+            }
+        } else if (layer.type === 'raster') {
+            const sourceId = `source-${layer.id}`;
+            const layerId = `raster-${layer.id}`;
+            const filename = layer.url.replace('/processed/', '');
+
+            try {
+                const infoRes = await axios.get(`${BACKEND_URL}/api/tiles/info?url=${filename}`);
+                const info = infoRes.data;
+
+                if (!targetMap.getSource(sourceId)) {
+                    targetMap.addSource(sourceId, {
+                        type: 'raster',
+                        tiles: [`${BACKEND_URL}/api/tiles/{z}/{x}/{y}.png?url=${filename}`],
+                        tileSize: 256,
+                        bounds: info.bounds,
+                        minzoom: info.minzoom || 0,
+                        maxzoom: info.maxzoom || 22
+                    });
+                }
+
+                if (!targetMap.getLayer(layerId)) {
+                    targetMap.addLayer({
+                        id: layerId,
+                        type: 'raster',
+                        source: sourceId,
+                        paint: { 'raster-opacity': 0.85 }
+                    });
+                }
+            } catch (e) {
+                console.warn('[Compare] Failed to add raster:', e);
+            }
+        }
+    };
+
+    const getColorExpression = (layerName) => {
+        const ln = layerName.toLowerCase();
+        const isCD = ln.includes('cd') || ln.includes('change') || ln.includes('결과') || ln.includes('result');
+        if (!isCD) return styleSettings.defaultBorder;
+
+        // Helper to get normalized (lowercase) string value of a property
+        const getNorm = (prop) => ['downcase', ['coalesce', ['to-string', ['get', prop]], '']];
+
+        return [
+            'case',
+            ['any',
+                ['in', '신축', getNorm('class_name')], ['in', 'new', getNorm('class_name')], ['in', 'added', getNorm('class_name')],
+                ['in', '신축', getNorm('class')], ['in', 'new', getNorm('class')], ['in', 'added', getNorm('class')],
+                ['in', '신축', getNorm('cls')], ['in', 'new', getNorm('cls')], ['in', 'added', getNorm('cls')]
+            ], styleSettings.newBuild,
+            ['any',
+                ['in', '소멸', getNorm('class_name')], ['in', 'demolished', getNorm('class_name')], ['in', 'deleted', getNorm('class_name')],
+                ['in', '소멸', getNorm('class')], ['in', 'demolished', getNorm('class')], ['in', 'deleted', getNorm('class')],
+                ['in', '소멸', getNorm('cls')], ['in', 'demolished', getNorm('cls')], ['in', 'deleted', getNorm('cls')]
+            ], styleSettings.destroyed,
+            ['any',
+                ['in', '갱신', getNorm('class_name')], ['in', 'updated', getNorm('class_name')], ['in', 'changed', getNorm('class_name')],
+                ['in', '갱신', getNorm('class')], ['in', 'updated', getNorm('class')], ['in', 'changed', getNorm('class')],
+                ['in', '갱신', getNorm('cls')], ['in', 'updated', getNorm('cls')], ['in', 'changed', getNorm('cls')]
+            ], styleSettings.renewed,
+            styleSettings.defaultBorder
+        ];
+    };
 
     const toast = useCallback((msg, type = 'success') => {
         const id = Date.now();
@@ -100,8 +350,8 @@ function App() {
             const vis = {};
             list.forEach(l => { vis[l.id] = true; });
             setLayerVisibility(vis);
-            for (let i = 0; i < list.length; i++) {
-                await addLayer(list[i], i);
+            for (const layer of list) {
+                await addLayerToMap(layer);
             }
         } catch (e) {
             console.error(e);
@@ -121,11 +371,24 @@ function App() {
     const processLocal = async (filename) => {
         setUploading(true);
         try {
-            const res = await uploadAxios.post(`${API_BASE}/api/process-local`, { filename });
-            const newLayer = { id: res.data.id, name: res.data.name, type: res.data.type, url: res.data.url };
-            setLayers(p => [newLayer, ...p]);
+            const res = await uploadAxios.post(`${API_BASE}/api/upload-local`, { filename });
+            const newLayer = {
+                id: res.data.id,
+                name: res.data.name,
+                type: res.data.type,
+                url: res.data.url,
+                pmtilesUrl: res.data.pmtilesUrl || null
+            };
+            // Prevent duplicate layers
+            setLayers(prev => {
+                if (prev.some(layer => layer.id === newLayer.id)) {
+                    console.warn('Duplicate layer ignored:', newLayer.id);
+                    return prev;
+                }
+                return [newLayer, ...prev];
+            });
             setLayerVisibility(p => ({ ...p, [newLayer.id]: true }));
-            await addLayer(newLayer, 0);
+            await addLayerToMap(newLayer);
             toast(`${newLayer.name} loaded!`);
             fetchLocalFiles();
         } catch (e) {
@@ -147,10 +410,23 @@ function App() {
                 headers: { 'Content-Type': 'multipart/form-data' },
                 onUploadProgress: (e) => setUploadProgress(Math.round((e.loaded * 100) / e.total))
             });
-            const newLayer = { id: res.data.id, name: res.data.name, type: res.data.type, url: res.data.url };
-            setLayers(p => [newLayer, ...p]);
+            const newLayer = {
+                id: res.data.id,
+                name: res.data.name,
+                type: res.data.type,
+                url: res.data.url,
+                pmtilesUrl: res.data.pmtilesUrl || null
+            };
+            // Prevent duplicate layers
+            setLayers(prev => {
+                if (prev.some(layer => layer.id === newLayer.id)) {
+                    console.warn('Duplicate layer ignored:', newLayer.id);
+                    return prev;
+                }
+                return [newLayer, ...prev];
+            });
             setLayerVisibility(p => ({ ...p, [newLayer.id]: true }));
-            await addLayer(newLayer, 0);
+            await addLayerToMap(newLayer);
             toast(`${newLayer.name} uploaded!`);
         } catch (e) {
             toast(e.response?.data?.detail || 'Upload failed', 'error');
@@ -160,192 +436,266 @@ function App() {
         }
     };
 
-    const getOrCreatePane = (layerId, zIndex) => {
-        const map = mapInstanceRef.current;
-        if (!map) return null;
-
-        const paneName = `layer-${layerId}`;
-        let pane = map.getPane(paneName);
-
-        if (!pane) {
-            pane = map.createPane(paneName);
-        }
-
-        pane.style.zIndex = 400 + zIndex;
-        layerPanesRef.current[layerId] = pane;
-        return paneName;
-    };
-
-    // Create style function for vector layers
-    const createStyleFunction = (layerName, settings) => {
+    // Get color based on feature properties for vector tiles
+    const getFeatureColor = (layerName, properties) => {
         const layerNameLower = layerName.toLowerCase();
-        const isBaseMap = layerNameLower.includes('수치지도') ||
-            layerNameLower.includes('digital_map') ||
-            layerNameLower.includes('base');
         const isChangeDetection = layerNameLower.includes('cd') ||
             layerNameLower.includes('change') ||
             layerNameLower.includes('결과') ||
             layerNameLower.includes('result');
 
-        return (feature) => {
-            // Base map style: transparent fill, thin border
-            if (isBaseMap) {
-                return {
-                    color: settings.baseMapBorder,
-                    weight: Math.max(0.5, settings.lineWeight * 0.5),
-                    opacity: 0.7,
-                    fillColor: 'transparent',
-                    fillOpacity: 0
-                };
-            }
+        if (!isChangeDetection) return styleSettings.defaultBorder;
 
-            // Change detection style: color by class
-            if (isChangeDetection && feature?.properties) {
-                // Check various possible field names for class info
-                const className = feature.properties.class_name ||
-                    feature.properties.class ||
-                    feature.properties.type ||
-                    feature.properties.category ||
-                    feature.properties.cd_type ||
-                    feature.properties.change_type || '';
+        const className = properties?.class_name ||
+            properties?.class ||
+            properties?.type ||
+            properties?.category ||
+            properties?.cd_type ||
+            properties?.change_type || '';
 
-                const classLower = String(className).toLowerCase();
+        const classLower = String(className).toLowerCase();
 
-                let borderColor = settings.defaultBorder;
-
-                // Match new/신축/added
-                if (classLower.includes('new') || classLower.includes('신축') || classLower.includes('added')) {
-                    borderColor = settings.newBuild;
-                }
-                // Match demolished/소멸/deleted/removed
-                else if (classLower.includes('demolished') || classLower.includes('소멸') ||
-                    classLower.includes('deleted') || classLower.includes('removed')) {
-                    borderColor = settings.destroyed;
-                }
-                // Match updated/갱신/changed/modified
-                else if (classLower.includes('updated') || classLower.includes('갱신') ||
-                    classLower.includes('changed') || classLower.includes('modified')) {
-                    borderColor = settings.renewed;
-                }
-
-                return {
-                    color: borderColor,
-                    weight: settings.lineWeight,
-                    opacity: 0.9,
-                    fillColor: borderColor,
-                    fillOpacity: 0.25
-                };
-            }
-
-            // Default style
-            return {
-                color: settings.defaultBorder,
-                weight: settings.lineWeight,
-                opacity: 0.8,
-                fillOpacity: 0.35
-            };
-        };
+        if (classLower.includes('new') || classLower.includes('신축') || classLower.includes('added')) {
+            return styleSettings.newBuild;
+        }
+        if (classLower.includes('demolished') || classLower.includes('소멸') ||
+            classLower.includes('deleted') || classLower.includes('removed')) {
+            return styleSettings.destroyed;
+        }
+        if (classLower.includes('updated') || classLower.includes('갱신') ||
+            classLower.includes('changed') || classLower.includes('modified')) {
+            return styleSettings.renewed;
+        }
+        return styleSettings.defaultBorder;
     };
 
-    const addLayer = async (layer, orderIndex = 0) => {
-        const map = mapInstanceRef.current;
+    const addLayerToMap = async (layer) => {
+        const map = mapRef.current;
         if (!map) return;
-
-        if (layerObjectsRef.current[layer.id]) {
-            map.removeLayer(layerObjectsRef.current[layer.id]);
-        }
 
         setLoading(p => ({ ...p, [layer.id]: true }));
 
         try {
-            const paneName = getOrCreatePane(layer.id, 100 - orderIndex);
-            let leafletLayer;
-
             if (layer.type === 'vector') {
-                const res = await fetch(`${API_BASE}${layer.url}`);
-                const geojson = await res.json();
+                // Use PMTiles if available
+                if (layer.pmtilesUrl) {
+                    const pmtilesFilename = layer.pmtilesUrl.replace('/processed/', '');
+                    const pmtilesFullUrl = `${BACKEND_URL}/api/cog/${pmtilesFilename}`;
+                    const sourceUrl = `pmtiles://${BACKEND_URL}/api/cog/${pmtilesFilename}`;
 
-                const styleFunc = createStyleFunction(layer.name, styleSettings);
+                    const sourceId = `source-${layer.id}`;
+                    const fillLayerId = `fill-${layer.id}`;
+                    const lineLayerId = `line-${layer.id}`;
 
-                leafletLayer = L.geoJSON(geojson, {
-                    pane: paneName,
-                    style: styleFunc,
-                    onEachFeature: (f, lyr) => {
-                        if (f.properties && Object.keys(f.properties).length) {
-                            const html = Object.entries(f.properties).slice(0, 8)
-                                .map(([k, v]) => `<b>${k}:</b> ${v}`).join('<br>');
-                            lyr.bindPopup(html);
+                    // Fetch PMTiles metadata to get source-layer name
+                    let sourceLayerName = 'default';
+                    try {
+                        const p = new pmtiles.PMTiles(pmtilesFullUrl);
+                        const header = await p.getHeader();
+                        const metadata = await p.getMetadata();
+
+                        console.log('[PMTiles] Header:', header);
+                        console.log('[PMTiles] Metadata:', metadata);
+
+                        // Get source layer name from vector_layers
+                        if (metadata?.vector_layers && metadata.vector_layers.length > 0) {
+                            sourceLayerName = metadata.vector_layers[0].id;
+                            console.log('[PMTiles] Using source-layer:', sourceLayerName);
+                        } else if (metadata?.tilestats?.layers && metadata.tilestats.layers.length > 0) {
+                            sourceLayerName = metadata.tilestats.layers[0].layer;
+                            console.log('[PMTiles] Using source-layer from tilestats:', sourceLayerName);
+                        }
+                    } catch (metaError) {
+                        console.warn('[PMTiles] Could not fetch metadata:', metaError);
+                        // Try common layer names
+                        sourceLayerName = layer.name || 'default';
+                    }
+
+                    // Add PMTiles source
+                    if (!map.getSource(sourceId)) {
+                        map.addSource(sourceId, {
+                            type: 'vector',
+                            url: sourceUrl
+                        });
+                    }
+
+                    // Wait for source to be ready
+                    await new Promise(resolve => setTimeout(resolve, 300));
+
+                    // Add fill layer
+                    if (!map.getLayer(fillLayerId)) {
+                        try {
+                            map.addLayer({
+                                id: fillLayerId,
+                                type: 'fill',
+                                source: sourceId,
+                                'source-layer': sourceLayerName,
+                                paint: {
+                                    'fill-color': getColorExpression(layer.name),
+                                    'fill-opacity': styleSettings.fillOpacity
+                                }
+                            });
+                        } catch (e) {
+                            console.warn('[PMTiles] Fill layer error:', e.message);
                         }
                     }
-                });
 
-                leafletLayer.addTo(map);
-                layerObjectsRef.current[layer.id] = leafletLayer;
+                    // Add line layer
+                    if (!map.getLayer(lineLayerId)) {
+                        try {
+                            map.addLayer({
+                                id: lineLayerId,
+                                type: 'line',
+                                source: sourceId,
+                                'source-layer': sourceLayerName,
+                                paint: {
+                                    'line-color': getColorExpression(layer.name),
+                                    'line-width': styleSettings.lineWeight
+                                }
+                            });
+                        } catch (e) {
+                            console.warn('[PMTiles] Line layer error:', e.message);
+                        }
+                    }
 
-                const bounds = leafletLayer.getBounds();
-                if (bounds.isValid()) map.fitBounds(bounds, { padding: [50, 50] });
+                    // Get bounds from GeoJSON fallback
+                    try {
+                        const res = await fetch(`${API_BASE}${layer.url}`);
+                        const geojson = await res.json();
+                        if (geojson.features?.length) {
+                            const bounds = new maplibregl.LngLatBounds();
+                            geojson.features.forEach(f => {
+                                if (f.geometry?.coordinates) {
+                                    const coords = f.geometry.coordinates.flat(3);
+                                    for (let i = 0; i < coords.length; i += 2) {
+                                        if (typeof coords[i] === 'number' && typeof coords[i + 1] === 'number') {
+                                            bounds.extend([coords[i], coords[i + 1]]);
+                                        }
+                                    }
+                                }
+                            });
+                            if (!bounds.isEmpty()) {
+                                map.fitBounds(bounds, { padding: 50 });
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Could not get bounds from GeoJSON:', e);
+                    }
+
+                    console.log('[PMTiles] Vector layer added:', layer.id);
+
+                } else {
+                    // Fallback to GeoJSON
+                    const res = await fetch(`${API_BASE}${layer.url}`);
+                    const geojson = await res.json();
+
+                    const sourceId = `source-${layer.id}`;
+                    const fillLayerId = `fill-${layer.id}`;
+                    const lineLayerId = `line-${layer.id}`;
+
+                    if (!map.getSource(sourceId)) {
+                        map.addSource(sourceId, {
+                            type: 'geojson',
+                            data: geojson
+                        });
+                    }
+
+                    if (!map.getLayer(fillLayerId)) {
+                        map.addLayer({
+                            id: fillLayerId,
+                            type: 'fill',
+                            source: sourceId,
+                            paint: {
+                                'fill-color': styleSettings.defaultBorder,
+                                'fill-opacity': styleSettings.fillOpacity
+                            }
+                        });
+                    }
+
+                    if (!map.getLayer(lineLayerId)) {
+                        map.addLayer({
+                            id: lineLayerId,
+                            type: 'line',
+                            source: sourceId,
+                            paint: {
+                                'line-color': styleSettings.defaultBorder,
+                                'line-width': styleSettings.lineWeight
+                            }
+                        });
+                    }
+
+                    // Fit bounds
+                    if (geojson.features?.length) {
+                        const bounds = new maplibregl.LngLatBounds();
+                        geojson.features.forEach(f => {
+                            if (f.geometry?.coordinates) {
+                                const coords = f.geometry.coordinates.flat(3);
+                                for (let i = 0; i < coords.length; i += 2) {
+                                    if (typeof coords[i] === 'number' && typeof coords[i + 1] === 'number') {
+                                        bounds.extend([coords[i], coords[i + 1]]);
+                                    }
+                                }
+                            }
+                        });
+                        if (!bounds.isEmpty()) {
+                            map.fitBounds(bounds, { padding: 50 });
+                        }
+                    }
+                }
 
             } else if (layer.type === 'raster') {
-                // ============================================================
-                // COG STREAMING with Custom Range Request Endpoint
-                // Uses /api/cog/{filename} which properly returns 206 Partial Content
-                // This fixes the RangeError: Invalid typed array length issue
-                //
-                // DEBUG: Check browser Network tab for the TIF request:
-                // - 206 Partial Content (multiple small requests) → streaming works ✓
-                // - 200 OK (one large request) → not streaming
-                // ============================================================
-
-                // Extract filename from layer.url (e.g., "/processed/file.tif" -> "file.tif")
+                // Use dynamic XYZ tiles from rio-tiler
                 const filename = layer.url.replace('/processed/', '');
-                const cogUrl = `${BACKEND_URL}/api/cog/${filename}`;
-                console.log('[COG] Loading via Range API:', cogUrl);
+                const sourceId = `source-${layer.id}`;
+                const layerId = `raster-${layer.id}`;
 
+                // Get tile info for bounds
                 try {
-                    const georaster = await parseGeoraster(cogUrl);
-                    console.log('[COG] Georaster loaded successfully:', {
-                        width: georaster.width,
-                        height: georaster.height,
-                        numberOfRasters: georaster.numberOfRasters
-                    });
+                    const infoRes = await axios.get(`${BACKEND_URL}/api/tiles/info?url=${filename}`);
+                    const info = infoRes.data;
 
-                    leafletLayer = new GeoRasterLayer({
-                        georaster,
-                        opacity: 0.85,
-                        resolution: 256,  // Higher value = better quality, uses overviews
-                        pane: paneName
-                    });
+                    if (!map.getSource(sourceId)) {
+                        map.addSource(sourceId, {
+                            type: 'raster',
+                            tiles: [`${BACKEND_URL}/api/tiles/{z}/{x}/{y}.png?url=${filename}`],
+                            tileSize: 256,
+                            bounds: info.bounds,
+                            minzoom: info.minzoom || 0,
+                            maxzoom: info.maxzoom || 22
+                        });
+                    }
 
-                    leafletLayer.addTo(map);
-                    layerObjectsRef.current[layer.id] = leafletLayer;
+                    if (!map.getLayer(layerId)) {
+                        map.addLayer({
+                            id: layerId,
+                            type: 'raster',
+                            source: sourceId,
+                            paint: {
+                                'raster-opacity': 0.85
+                            }
+                        });
+                    }
 
-                    setTimeout(() => {
-                        const bounds = leafletLayer.getBounds();
-                        if (bounds) map.fitBounds(bounds, { padding: [50, 50] });
-                    }, 100);
-                } catch (cogError) {
-                    console.error('[COG] Streaming failed, trying fallback:', cogError);
+                    // Fit to bounds with validation
+                    if (info.bounds && info.bounds.length === 4) {
+                        const [minlng, minlat, maxlng, maxlat] = info.bounds;
+                        // Basic validation: lat must be between -90 and 90, lng between -180 and 180
+                        if (Math.abs(minlat) <= 90 && Math.abs(maxlat) <= 90 &&
+                            Math.abs(minlng) <= 180 && Math.abs(maxlng) <= 180) {
+                            map.fitBounds([
+                                [minlng, minlat],
+                                [maxlng, maxlat]
+                            ], { padding: 50 });
+                        } else {
+                            console.warn('[XYZ Tiles] Invalid LngLat bounds, skipping fitBounds:', info.bounds);
+                        }
+                    }
 
-                    // Fallback: fetch entire file (slower but works)
-                    toast('COG streaming failed, using fallback...', 'error');
-                    const res = await fetch(`${API_BASE}${layer.url}`);
-                    const arrayBuffer = await res.arrayBuffer();
-                    const georaster = await parseGeoraster(arrayBuffer);
+                    console.log('[XYZ Tiles] Raster layer added:', layer.id);
 
-                    leafletLayer = new GeoRasterLayer({
-                        georaster,
-                        opacity: 0.85,
-                        resolution: 256,
-                        pane: paneName
-                    });
-
-                    leafletLayer.addTo(map);
-                    layerObjectsRef.current[layer.id] = leafletLayer;
-
-                    setTimeout(() => {
-                        const bounds = leafletLayer.getBounds();
-                        if (bounds) map.fitBounds(bounds, { padding: [50, 50] });
-                    }, 100);
+                } catch (e) {
+                    console.error('[XYZ Tiles] Failed to add raster:', e);
+                    toast(`Failed to load raster: ${e.message}`, 'error');
                 }
             }
         } catch (e) {
@@ -357,24 +707,47 @@ function App() {
     };
 
     const toggleVisibility = (id) => {
-        const pane = layerPanesRef.current[id];
-        if (!pane) return;
+        const map = mapRef.current;
+        if (!map) return;
 
         const visible = layerVisibility[id];
-        pane.style.display = visible ? 'none' : '';
+        const newVisibility = visible ? 'none' : 'visible';
+
+        // Toggle all layers for this source
+        const fillLayerId = `vector-fill-${id}`;
+        const lineLayerId = `vector-line-${id}`;
+        const rasterLayerId = `raster-${id}`;
+
+        [fillLayerId, lineLayerId, rasterLayerId].forEach(layerId => {
+            if (map.getLayer(layerId)) {
+                map.setLayoutProperty(layerId, 'visibility', newVisibility);
+            }
+        });
+
         setLayerVisibility(p => ({ ...p, [id]: !visible }));
     };
 
     const deleteLayer = async (id) => {
-        if (swipeLayerId === id) stopSwipe();
         try {
             await axios.delete(`${API_BASE}/api/layers/${id}`);
-            const map = mapInstanceRef.current;
-            if (layerObjectsRef.current[id]) {
-                map.removeLayer(layerObjectsRef.current[id]);
-                delete layerObjectsRef.current[id];
+            const map = mapRef.current;
+
+            // Remove layers and source
+            const fillLayerId = `vector-fill-${id}`;
+            const lineLayerId = `vector-line-${id}`;
+            const rasterLayerId = `raster-${id}`;
+            const sourceId = `source-${id}`;
+
+            [fillLayerId, lineLayerId, rasterLayerId].forEach(layerId => {
+                if (map.getLayer(layerId)) {
+                    map.removeLayer(layerId);
+                }
+            });
+
+            if (map.getSource(sourceId)) {
+                map.removeSource(sourceId);
             }
-            delete layerPanesRef.current[id];
+
             setLayers(p => p.filter(l => l.id !== id));
             setLayerVisibility(p => { const n = { ...p }; delete n[id]; return n; });
             toast('Deleted');
@@ -383,229 +756,114 @@ function App() {
         }
     };
 
-    const reorderLayers = (fromIdx, toIdx) => {
-        if (fromIdx === toIdx) return;
-        const arr = [...layers];
-        const [item] = arr.splice(fromIdx, 1);
-        arr.splice(toIdx, 0, item);
-        setLayers(arr);
-
-        arr.forEach((layer, idx) => {
-            const pane = layerPanesRef.current[layer.id];
-            if (pane) {
-                pane.style.zIndex = 400 + (100 - idx);
-            }
-        });
-    };
-
     // Handle style setting changes
     const handleStyleChange = (key, value) => {
         setStyleSettings(prev => ({ ...prev, [key]: value }));
     };
 
-    // ===== SWIPE with real clipping =====
-    const startSwipe = (id) => {
-        const map = mapInstanceRef.current;
-        const pane = layerPanesRef.current[id];
+    // Get FPS color based on performance
+    const getFpsColor = () => {
+        if (fps >= 50) return '#00ff00';
+        if (fps >= 30) return '#ffff00';
+        return '#ff0000';
+    };
 
-        if (!map || !pane) {
-            console.error('Swipe: map or pane not found', { map: !!map, pane: !!pane });
-            toast('Cannot start swipe - pane not found', 'error');
-            return;
+    // Start/Stop Swipe
+    const toggleSwipe = (id) => {
+        if (swipeLayerId === id) {
+            setSwipeLayerId(null);
+        } else {
+            setSwipeLayerId(id);
         }
+    };
 
-        stopSwipe();
+    const reorderMapLayers = (newLayersList, specificMap = null) => {
+        const map = specificMap || mapRef.current;
+        if (!map) return;
 
-        const container = map.getContainer();
-        const layerName = layers.find(l => l.id === id)?.name || id;
-
-        const divider = document.createElement('div');
-        divider.id = 'swipe-divider';
-        divider.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 50%;
-            width: 4px;
-            height: 100%;
-            background: linear-gradient(180deg, #3b82f6 0%, #10b981 100%);
-            transform: translateX(-50%);
-            z-index: 1000;
-            cursor: ew-resize;
-            pointer-events: auto;
-            box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
-        `;
-
-        const handle = document.createElement('div');
-        handle.id = 'swipe-handle';
-        handle.style.cssText = `
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 40px;
-            height: 40px;
-            background: white;
-            border-radius: 50%;
-            transform: translate(-50%, -50%);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-            cursor: ew-resize;
-            pointer-events: auto;
-            z-index: 1001;
-            font-size: 18px;
-            user-select: none;
-        `;
-        handle.textContent = '⇔';
-
-        const label = document.createElement('div');
-        label.id = 'swipe-label';
-        label.style.cssText = `
-            position: absolute;
-            top: 10px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0,0,0,0.85);
-            color: white;
-            padding: 5px 12px;
-            border-radius: 4px;
-            font-size: 11px;
-            z-index: 1002;
-            pointer-events: none;
-            white-space: nowrap;
-        `;
-        label.textContent = `Swipe: ${layerName}`;
-
-        container.appendChild(divider);
-        container.appendChild(handle);
-        container.appendChild(label);
-
-        let currentPct = 50;
-        let rafId = null;
-
-        const getPaneOffset = () => {
-            const mapPane = map.getPane('mapPane');
-            if (!mapPane) return { x: 0, y: 0 };
-
-            const transform = mapPane.style.transform;
-            const match = transform.match(/translate3d\(([^,]+),\s*([^,]+),/);
-            if (match) {
-                return {
-                    x: parseFloat(match[1]) || 0,
-                    y: parseFloat(match[2]) || 0
-                };
-            }
-            return { x: 0, y: 0 };
-        };
-
-        const applyClip = (pct) => {
-            currentPct = pct;
-            divider.style.left = `${pct}%`;
-            handle.style.left = `${pct}%`;
-            setSwipePosition(pct);
-
-            const containerWidth = container.offsetWidth;
-            const containerHeight = container.offsetHeight;
-            const containerClipX = (pct / 100) * containerWidth;
-            const offset = getPaneOffset();
-
-            const adjustedClipRight = containerClipX - offset.x;
-            const adjustedClipLeft = -offset.x;
-            const adjustedClipTop = -offset.y;
-            const adjustedClipBottom = containerHeight - offset.y;
-
-            pane.style.clip = `rect(${adjustedClipTop}px, ${adjustedClipRight}px, ${adjustedClipBottom}px, ${adjustedClipLeft}px)`;
-        };
-
-        const scheduleUpdate = () => {
-            if (rafId) return;
-            rafId = requestAnimationFrame(() => {
-                rafId = null;
-                applyClip(currentPct);
+        // MapLibre moveLayer: target layer is placed BEFORE the reference layer
+        // In our list, index 0 is TOP (drawn last).
+        [...newLayersList].reverse().forEach(l => {
+            const fillId = `fill-${l.id}`;
+            const lineId = `line-${l.id}`;
+            const rasterId = `raster-${l.id}`;
+            [fillId, lineId, rasterId].forEach(lid => {
+                if (map.getLayer(lid)) map.moveLayer(lid);
             });
-        };
+        });
+    };
 
-        const onMapChange = () => scheduleUpdate();
+    const handleDragEnd = (result) => {
+        if (!result.destination) return;
 
-        map.on('move', onMapChange);
-        map.on('zoom', onMapChange);
-        map.on('resize', onMapChange);
-        map.on('moveend', onMapChange);
-        map.on('zoomend', onMapChange);
+        const reordered = Array.from(layers);
+        const [removed] = reordered.splice(result.source.index, 1);
+        reordered.splice(result.destination.index, 0, removed);
 
-        let dragging = false;
+        setLayers(reordered);
+        reorderMapLayers(reordered);
+    };
 
-        const onMouseMove = (e) => {
-            if (!dragging) return;
-            e.preventDefault();
-            const x = e.touches ? e.touches[0].clientX : e.clientX;
-            const rect = container.getBoundingClientRect();
-            let pct = ((x - rect.left) / rect.width) * 100;
-            pct = Math.max(5, Math.min(95, pct));
-            applyClip(pct);
-        };
+    const moveLayer = (id, direction) => {
+        const index = layers.findIndex(l => l.id === id);
+        if (index < 0) return;
 
-        const onMouseUp = () => {
-            dragging = false;
-            map.dragging.enable();
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
-            document.removeEventListener('touchmove', onMouseMove);
-            document.removeEventListener('touchend', onMouseUp);
-        };
+        const newIndex = direction === 'up' ? index - 1 : index + 1;
+        if (newIndex < 0 || newIndex >= layers.length) return;
 
-        const onMouseDown = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            dragging = true;
-            map.dragging.disable();
-            document.addEventListener('mousemove', onMouseMove);
-            document.addEventListener('mouseup', onMouseUp);
-            document.addEventListener('touchmove', onMouseMove, { passive: false });
-            document.addEventListener('touchend', onMouseUp);
-        };
-
-        divider.addEventListener('mousedown', onMouseDown);
-        divider.addEventListener('touchstart', onMouseDown, { passive: false });
-        handle.addEventListener('mousedown', onMouseDown);
-        handle.addEventListener('touchstart', onMouseDown, { passive: false });
-
-        applyClip(50);
-
-        swipeRef.current = {
-            pane,
-            cleanup: () => {
-                if (rafId) cancelAnimationFrame(rafId);
-                divider.remove();
-                handle.remove();
-                label.remove();
-                pane.style.clip = '';
-                pane.style.clipPath = '';
-                map.dragging.enable();
-                map.off('move', onMapChange);
-                map.off('zoom', onMapChange);
-                map.off('resize', onMapChange);
-                map.off('moveend', onMapChange);
-                map.off('zoomend', onMapChange);
-            }
-        };
-
-        setSwipeLayerId(id);
-        toast('Drag handle to clip layer');
+        const newLayers = [...layers];
+        const [moved] = newLayers.splice(index, 1);
+        newLayers.splice(newIndex, 0, moved);
+        setLayers(newLayers);
+        reorderMapLayers(newLayers);
     };
 
     const stopSwipe = () => {
-        if (swipeRef.current) {
-            swipeRef.current.cleanup();
-            swipeRef.current = null;
-        }
         setSwipeLayerId(null);
-        setSwipePosition(50);
     };
 
     return (
         <div className="map-container">
-            <div id="map" ref={mapRef}></div>
+            {!swipeLayerId ? (
+                <div id="map" ref={mapContainerRef}></div>
+            ) : (
+                <div className="compare-wrapper">
+                    <div id="before-map" ref={beforeMapContainerRef} style={{ clipPath: `inset(0 ${100 - sliderValue}% 0 0)` }}></div>
+                    <div id="after-map" ref={afterMapContainerRef}></div>
+
+                    <div className="compare-label label-before">
+                        ⬅ {layers.find(l => l.id === swipeLayerId)?.name} (Swipe Content)
+                    </div>
+                    <div className="compare-label label-after">
+                        Background ➡
+                    </div>
+
+                    <div className="compare-slider-wrapper">
+                        <input
+                            type="range"
+                            className="compare-slider-custom"
+                            min="0"
+                            max="100"
+                            value={sliderValue}
+                            onChange={(e) => setSliderValue(parseInt(e.target.value))}
+                        />
+                        <div className="compare-handle" style={{ left: `${sliderValue}%` }}></div>
+                    </div>
+                    <button className="btn small stop-btn swipe-stop" onClick={stopSwipe}>Stop Swipe</button>
+                </div>
+            )}
+
+            {/* FPS Meter */}
+            <div className="fps-meter" style={{ color: getFpsColor() }}>
+                {fps} FPS
+            </div>
+
+            {/* Loading Overlay */}
+            {Object.values(loading).some(v => v) && (
+                <div className="layer-loading-overlay">
+                    <div className="spinner"></div>
+                </div>
+            )}
 
             <div className="control-panel">
                 <div className="card">
@@ -645,40 +903,56 @@ function App() {
                 )}
 
                 <div className="card">
-                    <div className="card-title">🗂 Layers ({layers.length}) <small>Top=Front</small></div>
+                    <div className="card-title">
+                        🗂 Layers ({layers.length})
+                    </div>
                     {layers.length === 0 ? <div className="empty">No layers</div> : (
-                        <div className="list">
-                            {layers.map((layer, idx) => (
-                                <div
-                                    key={layer.id}
-                                    className={`list-item ${draggedIdx === idx ? 'dragging' : ''} ${swipeLayerId === layer.id ? 'swiping' : ''}`}
-                                    draggable
-                                    onDragStart={() => setDraggedIdx(idx)}
-                                    onDragOver={(e) => e.preventDefault()}
-                                    onDrop={() => { reorderLayers(draggedIdx, idx); setDraggedIdx(null); }}
-                                    onDragEnd={() => setDraggedIdx(null)}
-                                >
-                                    <span className="handle">⋮</span>
-                                    <button className={`icon-btn ${layerVisibility[layer.id] ? '' : 'off'}`} onClick={() => toggleVisibility(layer.id)}>
-                                        {layerVisibility[layer.id] ? '👁' : '—'}
-                                    </button>
-                                    <span className={`badge ${layer.type}`}>{layer.type === 'raster' ? 'R' : 'V'}</span>
-                                    <span className="name">{loading[layer.id] ? '⏳' : ''}{layer.name}</span>
-                                    <button
-                                        className={`icon-btn swipe ${swipeLayerId === layer.id ? 'active' : ''}`}
-                                        onClick={() => swipeLayerId === layer.id ? stopSwipe() : startSwipe(layer.id)}
-                                        disabled={!layerVisibility[layer.id]}
-                                    >↔</button>
-                                    <button className="icon-btn del" onClick={() => deleteLayer(layer.id)}>×</button>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                    {swipeLayerId && (
-                        <div className="swipe-bar">
-                            <b>{layers.find(l => l.id === swipeLayerId)?.name}</b> | {Math.round(swipePosition)}%
-                            <button onClick={stopSwipe}>Stop</button>
-                        </div>
+                        <DragDropContext onDragEnd={handleDragEnd}>
+                            <Droppable droppableId="layers-list">
+                                {(provided) => (
+                                    <div
+                                        className="list"
+                                        {...provided.droppableProps}
+                                        ref={provided.innerRef}
+                                    >
+                                        {layers.map((layer, index) => (
+                                            <Draggable key={layer.id} draggableId={layer.id} index={index}>
+                                                {(provided, snapshot) => (
+                                                    <div
+                                                        ref={provided.innerRef}
+                                                        {...provided.draggableProps}
+                                                        {...provided.dragHandleProps}
+                                                        className={`list-item ${swipeLayerId === layer.id ? 'swiping' : ''} ${snapshot.isDragging ? 'dragging' : ''}`}
+                                                    >
+                                                        <button
+                                                            className={`icon-btn ${layerVisibility[layer.id] ? '' : 'off'}`}
+                                                            onClick={(e) => { e.stopPropagation(); toggleVisibility(layer.id); }}
+                                                        >
+                                                            {layerVisibility[layer.id] ? '👁' : '—'}
+                                                        </button>
+                                                        <span className={`badge ${layer.type}`}>
+                                                            {layer.type === 'raster' ? 'R' : layer.pmtilesUrl ? 'T' : 'V'}
+                                                        </span>
+                                                        <span className="name">{loading[layer.id] ? '⏳ ' : ''}{layer.name}</span>
+                                                        <div className="layer-actions">
+                                                            <button
+                                                                className={`icon-btn small swipe-btn ${swipeLayerId === layer.id ? 'active' : ''}`}
+                                                                onClick={(e) => { e.stopPropagation(); toggleSwipe(layer.id); }}
+                                                                title="Swipe this layer"
+                                                            >
+                                                                ↔
+                                                            </button>
+                                                            <button className="icon-btn del" onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>×</button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </Draggable>
+                                        ))}
+                                        {provided.placeholder}
+                                    </div>
+                                )}
+                            </Droppable>
+                        </DragDropContext>
                     )}
                 </div>
 
@@ -695,7 +969,7 @@ function App() {
                             <div className="style-section">
                                 <div className="style-section-title">Colors</div>
                                 <div className="style-row">
-                                    <span>🔴 신축 (New)</span>
+                                    <span>🔴 신축 (New / added)</span>
                                     <input
                                         type="color"
                                         value={styleSettings.newBuild}
@@ -703,7 +977,7 @@ function App() {
                                     />
                                 </div>
                                 <div className="style-row">
-                                    <span>🟢 소멸 (Demolished)</span>
+                                    <span>🟢 소멸 (Demolished / deleted)</span>
                                     <input
                                         type="color"
                                         value={styleSettings.destroyed}
@@ -711,7 +985,7 @@ function App() {
                                     />
                                 </div>
                                 <div className="style-row">
-                                    <span>🔵 갱신 (Updated)</span>
+                                    <span>🔵 갱신 (Updated / changed)</span>
                                     <input
                                         type="color"
                                         value={styleSettings.renewed}
@@ -739,6 +1013,21 @@ function App() {
                                         step="0.5"
                                         value={styleSettings.lineWeight}
                                         onChange={(e) => handleStyleChange('lineWeight', parseFloat(e.target.value))}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="style-section">
+                                <div className="style-section-title">Fill Opacity</div>
+                                <div className="style-row">
+                                    <span>Opacity: {(styleSettings.fillOpacity * 100).toFixed(0)}%</span>
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="1"
+                                        step="0.05"
+                                        value={styleSettings.fillOpacity}
+                                        onChange={(e) => handleStyleChange('fillOpacity', parseFloat(e.target.value))}
                                     />
                                 </div>
                             </div>

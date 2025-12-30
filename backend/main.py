@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 import asyncio
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -15,10 +16,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-import rasterio
-from rasterio.io import MemoryFile
-from rasterio.enums import Resampling
 import geopandas as gpd
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from shapely.geometry import Polygon, MultiPolygon
+
+# rio-tiler for dynamic COG XYZ tile generation
+from rio_tiler.io import Reader as TilerReader
+from rio_tiler.errors import TileOutsideBounds
+from pyproj import Transformer
 
 app = FastAPI(title="GIS Swipe Lab API", version="1.2.0")
 
@@ -88,15 +95,20 @@ async def get_cog_file(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
     
-    if not file_path.suffix.lower() in ['.tif', '.tiff']:
-        raise HTTPException(status_code=400, detail="Only TIF files are served via this endpoint")
+    if not file_path.suffix.lower() in ['.tif', '.tiff', '.pmtiles']:
+        raise HTTPException(status_code=400, detail="Only TIF and PMTiles files are served via this endpoint")
     
     file_size = file_path.stat().st_size
     
-    # Common headers
+    # Determine content type based on file extension
+    if file_path.suffix.lower() == '.pmtiles':
+        content_type = "application/octet-stream"
+    else:
+        content_type = "image/tiff"
+    
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Type": "image/tiff",
+        "Content-Type": content_type,
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
     }
@@ -168,8 +180,135 @@ async def get_cog_file(
         iter_file(),
         status_code=200,
         headers=headers,
-        media_type="image/tiff"
+        media_type=content_type
     )
+
+
+# ============================================================
+# Dynamic XYZ Tile Endpoint for COG files
+# Uses rio-tiler to generate tiles on-the-fly for MapLibre
+# ============================================================
+@app.get("/api/tiles/{z}/{x}/{y}.png")
+async def get_xyz_tile(z: int, x: int, y: int, url: str):
+    """
+    Generate XYZ tiles dynamically from a COG file.
+    This offloads heavy tile generation to the server (GPU-independent),
+    so the browser only needs to display pre-rendered PNG tiles.
+    
+    Args:
+        z, x, y: Standard XYZ tile coordinates
+        url: Filename of the COG in processed directory (e.g., "file.tif")
+    """
+    # Security: prevent path traversal
+    if ".." in url or url.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = (PROCESSED_DIR / url).absolute()
+    
+    if not file_path.exists():
+        print(f"[ERROR] Tile file not found: {file_path}")
+        raise HTTPException(status_code=404, detail=f"File not found: {url}")
+    
+    if not file_path.suffix.lower() in ['.tif', '.tiff']:
+        raise HTTPException(status_code=400, detail="Only TIF files supported for tile generation")
+    
+    try:
+        with TilerReader(str(file_path)) as src:
+            img = src.tile(x, y, z)
+            
+            # Render to PNG with proper handling of nodata/alpha
+            content = img.render(img_format="PNG")
+            
+            return Response(
+                content=content,
+                media_type="image/png",
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+    except TileOutsideBounds:
+        # Return transparent PNG for tiles outside the raster bounds
+        # 1x1 transparent PNG
+        transparent_png = bytes([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+            0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+        ])
+        return Response(
+            content=transparent_png,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tile generation error: {str(e)}")
+
+
+@app.get("/api/tiles/info")
+async def get_tile_info(url: str):
+    """
+    Get metadata about a COG file for proper map initialization.
+    Returns bounds, min/max zoom, and other tile info.
+    """
+    import traceback
+    
+    if ".." in url or url.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = (PROCESSED_DIR / url).absolute()
+    
+    print(f"[DEBUG] Tile info requested for: {url}")
+    print(f"[DEBUG] Full path: {file_path}")
+    print(f"[DEBUG] File exists: {file_path.exists()}")
+    
+    if not file_path.exists():
+        # List available files for debugging
+        available = [f.name for f in PROCESSED_DIR.iterdir() if f.suffix.lower() in ['.tif', '.tiff']]
+        print(f"[DEBUG] Available TIF files: {available}")
+        raise HTTPException(status_code=404, detail=f"File not found: {url}. Available: {available[:5]}")
+    
+    try:
+        with TilerReader(str(file_path)) as src:
+            # Get info
+            info = src.info()
+            
+            # Explicitly get WGS84 bounds
+            # src.bounds is usually WGS84 in rio-tiler Reader, 
+            # but let's double check the CRS and reproject if needed.
+            raw_bounds = src.dataset.bounds
+            src_crs = src.dataset.crs
+            
+            if src_crs and src_crs != "EPSG:4326":
+                try:
+                    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+                    min_lon, min_lat = transformer.transform(raw_bounds.left, raw_bounds.bottom)
+                    max_lon, max_lat = transformer.transform(raw_bounds.right, raw_bounds.top)
+                    bounds = [min_lon, min_lat, max_lon, max_lat]
+                    print(f"[DEBUG] Reprojected bounds from {src_crs} to EPSG:4326: {bounds}")
+                except Exception as e:
+                    print(f"[WARN] Reprojection failed, falling back to src.bounds: {e}")
+                    bounds = src.bounds
+            else:
+                bounds = src.bounds
+
+            return {
+                "bounds": bounds,
+                "minzoom": getattr(info, "minzoom", getattr(src, "minzoom", 0)),
+                "maxzoom": getattr(info, "maxzoom", getattr(src, "maxzoom", 22)),
+                "band_metadata": getattr(info, "band_metadata", []),
+                "dtype": getattr(info, "dtype", "uint8"),
+                "colorinterp": getattr(info, "colorinterp", None)
+            }
+    except Exception as e:
+        print(f"[ERROR] Error reading COG info for {file_path}:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error reading COG info: {str(e)}")
 
 
 def convert_to_cog(input_path: Path, output_path: Path) -> None:
@@ -233,8 +372,67 @@ def convert_to_cog(input_path: Path, output_path: Path) -> None:
                 dst.update_tags(ns='rio_overview', resampling='average')
 
 
-def convert_vector_to_geojson(input_path: Path, output_path: Path) -> None:
-    """Convert vector file to GeoJSON with EPSG:4326 and optional simplification"""
+def polygon_to_ellipse(poly, num_points=64):
+    """Convert a polygon to an elliptical approximation based on its MRR"""
+    if poly.is_empty:
+        return poly
+        
+    # Minimum rotated rectangle (MRR)
+    mrr = poly.minimum_rotated_rectangle
+    if mrr.geom_type != 'Polygon':
+        return poly
+        
+    coords = list(mrr.exterior.coords)
+    # MRR coords: p0, p1, p2, p3, p0
+    p0 = np.array(coords[0])
+    p1 = np.array(coords[1])
+    p2 = np.array(coords[2])
+    
+    center = (p0 + p2) / 2
+    v1 = p1 - p0
+    v2 = p2 - p1
+    
+    len1 = np.linalg.norm(v1)
+    len2 = np.linalg.norm(v2)
+    
+    # Semi-axes
+    a = len1 / 2
+    b = len2 / 2
+    
+    if a == 0 or b == 0:
+        return poly
+        
+    # Directions
+    u1 = v1 / len1
+    u2 = v2 / len2
+    
+    # Generate ellipse points
+    angles = np.linspace(0, 2*np.pi, num_points, endpoint=False)
+    ellipse_points = []
+    for angle in angles:
+        # P = Center + a*cos(t)*u1 + b*sin(t)*u2
+        p = center + a * np.cos(angle) * u1 + b * np.sin(angle) * u2
+        ellipse_points.append(tuple(p))
+        
+    return Polygon(ellipse_points)
+
+
+def transform_geometry_to_ellipse(geom):
+    """Handle both Polygon and MultiPolygon for ellipse transformation"""
+    from shapely.geometry import MultiPolygon
+    
+    if geom.geom_type == 'Polygon':
+        return polygon_to_ellipse(geom)
+    elif geom.geom_type == 'MultiPolygon':
+        return MultiPolygon([polygon_to_ellipse(p) for p in geom.geoms])
+    return geom
+
+
+def convert_vector_to_geojson(input_path: Path, output_path: Path, original_filename: Optional[str] = None) -> None:
+    """Convert vector file to GeoJSON with EPSG:4326.
+    No simplification - preserve original geometry for accurate rendering.
+    MapLibre + PMTiles handles large datasets efficiently via GPU.
+    """
     gdf = gpd.read_file(input_path)
     
     # Reproject to EPSG:4326 if needed
@@ -242,18 +440,44 @@ def convert_vector_to_geojson(input_path: Path, output_path: Path) -> None:
         gdf.set_crs(epsg=4326, inplace=True)
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
+
+    # Check if this is a CD layer (by filename or properties)
+    file_lower = str(input_path).lower()
+    orig_lower = str(original_filename).lower() if original_filename else ""
+    # Detection keywords: cd, result, change, 결과, 변화
+    is_cd_layer = any(kw in file_lower or kw in orig_lower for kw in ['cd', 'result', 'change', '결과', '변화', 'cd_results'])
     
-    # Simplify geometry for better performance if file is large
-    # Use file size as proxy for complexity
-    try:
-        file_size_mb = input_path.stat().st_size / (1024 * 1024)
-        if file_size_mb > 5:  # Simplify if larger than 5MB
-            gdf['geometry'] = gdf.geometry.simplify(tolerance=0.0001, preserve_topology=True)
-    except Exception:
-        pass  # Skip simplification if it fails
+    if is_cd_layer:
+        print(f"[DEBUG] Generating ellipses for CD layer: {input_path.name}")
+        # Apply ellipse transformation to all geometries
+        gdf.geometry = gdf.geometry.apply(transform_geometry_to_ellipse)
+        print(f"[DEBUG] Ellipse transformation complete for {len(gdf)} features")
     
-    # Save as GeoJSON
+    # Save as GeoJSON without simplification
     gdf.to_file(output_path, driver='GeoJSON')
+
+
+def convert_geojson_to_pmtiles(geojson_path: Path, output_path: Path) -> None:
+    """Convert GeoJSON to PMTiles using tippecanoe for fast vector tile rendering"""
+    try:
+        result = subprocess.run(
+            [
+                "tippecanoe",
+                "-zg",  # Auto zoom levels based on data density
+                "--drop-densest-as-needed",  # Minimal data loss while respecting tile size
+                "--extend-zooms-if-still-dropping",  # Extend max zoom if needed
+                "-o", str(output_path),
+                "--force",  # Overwrite output if exists
+                str(geojson_path)
+            ],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print(f"[PMTiles] Conversion successful: {output_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"[PMTiles] Conversion failed: {e.stderr}")
+        raise RuntimeError(f"PMTiles conversion failed: {e.stderr}")
 
 
 def extract_shapefile_from_zip(zip_path: Path, extract_dir: Path) -> Optional[Path]:
@@ -323,7 +547,18 @@ def process_file_sync(input_path: Path, filename: str, file_id: str, keep_source
             # Process vector
             output_name = f"{original_name}_{file_id}.geojson"
             output_path = PROCESSED_DIR / output_name
-            convert_vector_to_geojson(actual_input, output_path)
+            convert_vector_to_geojson(actual_input, output_path, filename)
+            
+            # Convert to PMTiles for fast vector tile rendering
+            pmtiles_name = f"{original_name}_{file_id}.pmtiles"
+            pmtiles_path = PROCESSED_DIR / pmtiles_name
+            pmtiles_url = None
+            try:
+                convert_geojson_to_pmtiles(output_path, pmtiles_path)
+                pmtiles_url = f"/processed/{pmtiles_name}"
+            except Exception as pmtiles_error:
+                print(f"[PMTiles] Warning: Could not generate PMTiles: {pmtiles_error}")
+                # Continue without PMTiles - fallback to GeoJSON
             
             # Clean up
             if temp_dir:
@@ -331,14 +566,20 @@ def process_file_sync(input_path: Path, filename: str, file_id: str, keep_source
             if not keep_source and input_path.parent == UPLOAD_DIR:
                 input_path.unlink(missing_ok=True)
             
-            return {
+            result = {
                 "success": True,
                 "id": file_id,
                 "name": original_name,
                 "type": "vector",
                 "url": f"/processed/{output_name}",
-                "message": "Vector converted to GeoJSON (EPSG:4326) successfully"
+                "message": "Vector converted successfully"
             }
+            
+            if pmtiles_url:
+                result["pmtilesUrl"] = pmtiles_url
+                result["message"] = "Vector converted to GeoJSON + PMTiles successfully"
+            
+            return result
         else:
             raise ValueError(f"Unsupported file format: {filename}")
             
@@ -346,31 +587,55 @@ def process_file_sync(input_path: Path, filename: str, file_id: str, keep_source
         raise e
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "geo-swipe-lab-api"}
 
 
-@app.get("/layers")
+@app.get("/api/layers")
 async def list_layers():
     """List all processed layers"""
     layers = []
+    seen_ids = set()  # Track seen IDs to prevent duplicates
     
     for file in PROCESSED_DIR.iterdir():
         if file.is_file():
+            # Skip PMTiles when there's a matching GeoJSON (same base name)
+            if file.suffix.lower() == '.pmtiles':
+                continue
+                
             layer_type = "raster" if file.suffix.lower() in ['.tif', '.tiff'] else "vector"
-            layers.append({
-                "id": file.stem,
-                "name": file.name,
+            
+            # Extract the UUID portion from filename (format: name_uuid.ext)
+            # Use full stem as ID for uniqueness
+            layer_id = file.stem
+            
+            # Skip if we've already seen this ID
+            if layer_id in seen_ids:
+                continue
+            seen_ids.add(layer_id)
+            
+            # Check for PMTiles companion file
+            pmtiles_path = PROCESSED_DIR / f"{file.stem}.pmtiles"
+            pmtiles_url = f"/processed/{file.stem}.pmtiles" if pmtiles_path.exists() else None
+            
+            layer_data = {
+                "id": layer_id,
+                "name": file.stem.rsplit('_', 1)[0] if '_' in file.stem else file.stem,
                 "type": layer_type,
                 "url": f"/processed/{file.name}"
-            })
+            }
+            
+            if pmtiles_url:
+                layer_data["pmtilesUrl"] = pmtiles_url
+            
+            layers.append(layer_data)
     
     return {"layers": layers}
 
 
-@app.get("/uploads")
+@app.get("/api/uploads")
 async def list_uploads():
     """List files in uploads directory (for local file processing)"""
     files = []
@@ -387,7 +652,7 @@ async def list_uploads():
     return {"files": files}
 
 
-@app.post("/upload")
+@app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     """
     Upload and process geospatial file with streaming support
@@ -398,8 +663,8 @@ async def upload_file(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
     
-    # Generate unique ID
-    file_id = str(uuid.uuid4())[:8]
+    # Generate unique ID - use full UUID to prevent collisions
+    file_id = str(uuid.uuid4())
     
     # Stream file to uploads directory first
     input_path = UPLOAD_DIR / f"{file_id}_{file.filename}"
@@ -426,7 +691,7 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 
-@app.post("/process-local")
+@app.post("/api/upload-local")
 async def process_local_file(request: LocalFileRequest):
     """
     Process a file that's already in the uploads directory
@@ -469,7 +734,7 @@ async def process_local_file(request: LocalFileRequest):
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 
-@app.delete("/layers/{layer_id}")
+@app.delete("/api/layers/{layer_id}")
 async def delete_layer(layer_id: str):
     """Delete a processed layer"""
     deleted = False
