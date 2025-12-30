@@ -23,8 +23,8 @@ const DEFAULT_STYLES = {
     newBuild: '#ff0000',
     destroyed: '#00ff00',
     renewed: '#0000ff',
-    baseMapBorder: '#333333',
-    defaultBorder: '#6b7280',
+    baseMapBorder: '#800080',
+    defaultBorder: '#800080',
     lineWeight: 2,
     fillOpacity: 0.25,
 };
@@ -135,30 +135,36 @@ function App() {
         };
     }, []);
 
-    // Update vector layer styles when settings change
+    // Update map layer styles when settings change
     useEffect(() => {
-        const map = mapRef.current;
-        if (!map || !map.isStyleLoaded()) return;
+        const updateMapStyles = (map) => {
+            if (!map || !map.isStyleLoaded()) return;
+            layers.forEach(layer => {
+                const fillId = `fill-${layer.id}`;
+                const lineId = `line-${layer.id}`;
+                const rasterId = `raster-${layer.id}`;
 
-        layers.forEach(layer => {
-            if (layer.type === 'vector' && layer.pmtilesUrl) {
-                const layerId = `vector-fill-${layer.id}`;
-                const lineId = `vector-line-${layer.id}`;
-
-                if (map.getLayer(layerId)) {
-                    map.setPaintProperty(layerId, 'fill-opacity', styleSettings.fillOpacity);
-                    // Update data-driven color expression if it's a CD layer
-                    const colorExpr = getColorExpression(layer.name);
-                    map.setPaintProperty(layerId, 'fill-color', colorExpr);
+                // Handle Vector (Fill)
+                if (map.getLayer(fillId)) {
+                    map.setPaintProperty(fillId, 'fill-opacity', styleSettings.fillOpacity);
+                    map.setPaintProperty(fillId, 'fill-color', getColorExpression(layer.name));
                 }
+                // Handle Vector (Line)
                 if (map.getLayer(lineId)) {
                     map.setPaintProperty(lineId, 'line-width', styleSettings.lineWeight);
-                    const colorExpr = getColorExpression(layer.name);
-                    map.setPaintProperty(lineId, 'line-color', colorExpr);
+                    map.setPaintProperty(lineId, 'line-color', getColorExpression(layer.name));
                 }
-            }
-        });
-    }, [styleSettings, layers]);
+                // Handle Raster
+                if (map.getLayer(rasterId)) {
+                    map.setPaintProperty(rasterId, 'raster-opacity', 0.85);
+                }
+            });
+        };
+
+        updateMapStyles(mapRef.current);
+        updateMapStyles(beforeMapRef.current);
+        updateMapStyles(afterMapRef.current);
+    }, [styleSettings, layers, swipeLayerId]);
 
     // Handle swipe mode setup (Manual Synchronization)
     useEffect(() => {
@@ -310,7 +316,7 @@ function App() {
     const getColorExpression = (layerName) => {
         const ln = layerName.toLowerCase();
         const isCD = ln.includes('cd') || ln.includes('change') || ln.includes('결과') || ln.includes('result');
-        if (!isCD) return styleSettings.defaultBorder;
+        if (!isCD) return styleSettings.baseMapBorder;
 
         // Helper to get normalized (lowercase) string value of a property
         const getNorm = (prop) => ['downcase', ['coalesce', ['to-string', ['get', prop]], '']];
@@ -332,7 +338,7 @@ function App() {
                 ['in', '갱신', getNorm('class')], ['in', 'updated', getNorm('class')], ['in', 'changed', getNorm('class')],
                 ['in', '갱신', getNorm('cls')], ['in', 'updated', getNorm('cls')], ['in', 'changed', getNorm('cls')]
             ], styleSettings.renewed,
-            styleSettings.defaultBorder
+            styleSettings.baseMapBorder
         ];
     };
 
@@ -353,6 +359,7 @@ function App() {
             for (const layer of list) {
                 await addLayerToMap(layer);
             }
+            reorderMapLayers(list);
         } catch (e) {
             console.error(e);
         }
@@ -389,6 +396,7 @@ function App() {
             });
             setLayerVisibility(p => ({ ...p, [newLayer.id]: true }));
             await addLayerToMap(newLayer);
+            reorderMapLayers([newLayer, ...layers]);
             toast(`${newLayer.name} loaded!`);
             fetchLocalFiles();
         } catch (e) {
@@ -427,6 +435,7 @@ function App() {
             });
             setLayerVisibility(p => ({ ...p, [newLayer.id]: true }));
             await addLayerToMap(newLayer);
+            reorderMapLayers([newLayer, ...layers]);
             toast(`${newLayer.name} uploaded!`);
         } catch (e) {
             toast(e.response?.data?.detail || 'Upload failed', 'error');
@@ -444,7 +453,7 @@ function App() {
             layerNameLower.includes('결과') ||
             layerNameLower.includes('result');
 
-        if (!isChangeDetection) return styleSettings.defaultBorder;
+        if (!isChangeDetection) return styleSettings.baseMapBorder;
 
         const className = properties?.class_name ||
             properties?.class ||
@@ -606,7 +615,7 @@ function App() {
                             type: 'fill',
                             source: sourceId,
                             paint: {
-                                'fill-color': styleSettings.defaultBorder,
+                                'fill-color': getColorExpression(layer.name),
                                 'fill-opacity': styleSettings.fillOpacity
                             }
                         });
@@ -618,7 +627,7 @@ function App() {
                             type: 'line',
                             source: sourceId,
                             paint: {
-                                'line-color': styleSettings.defaultBorder,
+                                'line-color': getColorExpression(layer.name),
                                 'line-width': styleSettings.lineWeight
                             }
                         });
@@ -714,8 +723,8 @@ function App() {
         const newVisibility = visible ? 'none' : 'visible';
 
         // Toggle all layers for this source
-        const fillLayerId = `vector-fill-${id}`;
-        const lineLayerId = `vector-line-${id}`;
+        const fillLayerId = `fill-${id}`;
+        const lineLayerId = `line-${id}`;
         const rasterLayerId = `raster-${id}`;
 
         [fillLayerId, lineLayerId, rasterLayerId].forEach(layerId => {
@@ -733,8 +742,8 @@ function App() {
             const map = mapRef.current;
 
             // Remove layers and source
-            const fillLayerId = `vector-fill-${id}`;
-            const lineLayerId = `vector-line-${id}`;
+            const fillLayerId = `fill-${id}`;
+            const lineLayerId = `line-${id}`;
             const rasterLayerId = `raster-${id}`;
             const sourceId = `source-${id}`;
 
